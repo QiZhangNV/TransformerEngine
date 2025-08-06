@@ -54,6 +54,7 @@ _2X_ACC_FPROP = False
 _2X_ACC_DGRAD = True
 _2X_ACC_WGRAD = True
 _multi_stream_cublas_workspace = []
+_cutlass_grouped_gemm_workspace = []
 _dummy_wgrads = {}
 _cublas_workspace = None
 _ub_communicators = None
@@ -68,6 +69,8 @@ def get_cublas_workspace_size_bytes() -> None:
         return 33_554_432
     return 4_194_304
 
+def get_cutlass_grouped_gemm_workspace_size_bytes() -> None:
+    return 16_777_216
 
 def get_workspace() -> torch.Tensor:
     """Returns workspace for cublas."""
@@ -88,6 +91,14 @@ def get_multi_stream_cublas_workspace() -> List[torch.Tensor]:
                 torch.empty(get_cublas_workspace_size_bytes(), dtype=torch.uint8, device="cuda")
             )
     return _multi_stream_cublas_workspace
+
+
+def get_cutlass_grouped_gemm_workspace() -> List[torch.Tensor]:
+    """Returns workspace for cutlass grouped gemm."""
+    global _cutlass_grouped_gemm_workspace
+    if not _cutlass_grouped_gemm_workspace:
+        _cutlass_grouped_gemm_workspace = [torch.empty(get_cutlass_grouped_gemm_workspace_size_bytes(), dtype=torch.uint8, device="cuda")]
+    return _cutlass_grouped_gemm_workspace
 
 
 def get_dummy_wgrad(shape: list, dtype: torch.dtype, zero=False) -> torch.Tensor:
