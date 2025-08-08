@@ -97,18 +97,11 @@ class _GroupedLinear(torch.autograd.Function):
         if not m_splits_on_devie:
             inputmats = torch.split(inp.view(-1, in_features), m_splits.tolist())
         else:
+            # Cannot split because the m_splits is not available on host.
             inputmats = [inp.view(-1, in_features)]
         if fp8:
             assert_dim_for_fp8_exec(*inputmats, *weights)
 
-        # print("num_gemms", num_gemms)
-        # print("inp.shape", inp.shape)
-        # print("weights[0].shape", weights[0].shape)
-        # print("weights[0]", weights[0])
-        # print("m_splits", m_splits, "dtype", m_splits.dtype)
-        # print("inputmats", inputmats)
-        # print("m_splits_on_devie", m_splits_on_devie)
-        # print("is_first_microbatch", is_first_microbatch)
         # Cast input to expected dtype
         inputmats_no_fp8 = [cast_if_needed(mat, activation_dtype) for mat in inputmats]
         inputmats = []
@@ -133,9 +126,6 @@ class _GroupedLinear(torch.autograd.Function):
         if output_quantizers[0] is not None:
             for output_quantizer in output_quantizers:
                 output_quantizer.set_usage(rowwise=True, columnwise=False)
-        # print("input_quantizers[0]", input_quantizers[0])
-        # print("weight_quantizers[0]", weight_quantizers[0])
-        # print("output_quantizers[0]", output_quantizers[0])
 
         fprop_gemm_use_split_accumulator = _2X_ACC_FPROP
         if fp8:
@@ -145,7 +135,6 @@ class _GroupedLinear(torch.autograd.Function):
             inputmats = tex.fused_multi_quantize(
                 inputmats_no_fp8, None, input_quantizers, TE_DType[activation_dtype]
             )
-            # print("inputmats after fused_multi_quantize", inputmats)
             weights_fp8 = []
             bias_dtype = torch.bfloat16 if activation_dtype == torch.float32 else activation_dtype
             # FP8 cast to workspace buffer
@@ -178,11 +167,7 @@ class _GroupedLinear(torch.autograd.Function):
                 dtype=activation_dtype,
                 device=device,
             )
-        # print("out.dtype", out.dtype)
-        # print("out.shape", out.shape)
         # print("===========fprop===========")
-        # print("inputmats[0].get_metadata_debug()", inputmats[0].get_metadata_debug())
-        # print("weights_fp8[0].get_metadata_debug()", weights_fp8[0].get_metadata_debug())
         _ = general_grouped_gemm(
             weights_fp8 if not m_splits_on_devie else inputmats,
             inputmats if not m_splits_on_devie else weights_fp8,
@@ -352,11 +337,7 @@ class _GroupedLinear(torch.autograd.Function):
                             rowwise_usage=quantizer.rowwise_usage,
                             columnwise_usage=quantizer.columnwise_usage,
                         )
-                # torch.cuda.synchronize()
                 # print("===========dgrad===========")
-                # print("grad_output:", grad_output)
-                # print("weights[0]:", weights[0].get_metadata())
-                # print("grad_output[0]:", grad_output[0].get_metadata())
                 general_grouped_gemm(
                     weights if not ctx.m_splits_on_devie else grad_output,
                     grad_output if not ctx.m_splits_on_devie else weights,
@@ -392,7 +373,7 @@ class _GroupedLinear(torch.autograd.Function):
                     workspaces=get_multi_stream_cublas_workspace() if not ctx.m_splits_on_devie else get_cutlass_grouped_gemm_workspace(),
                     layout="NT" if not ctx.m_splits_on_devie else "TN",
                     grad=True,
-                    wgrad=True,
+                    wgrad=True, # For cutlass backend
                     m_splits=ctx.m_splits,
                     m_splits_on_devie=ctx.m_splits_on_devie,
                     use_bias=ctx.use_bias if grad_biases[0] is None else None,
@@ -404,15 +385,8 @@ class _GroupedLinear(torch.autograd.Function):
                 if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():
                     ctx.wgrad_store.put([inputmats, grad_output, wgrad_list], grouped_gemm_wgrad)
                 else:
-                    # torch.cuda.synchronize()
                     # print("===========wgrad no delay===========")
-                    # print("grad_output[0]:", grad_output[0], grad_output[0].get_metadata_debug())
-                    # print("inputmats[0]:", inputmats[0].get_metadata_debug())
-                    # print("wgrad_list:", wgrad_list[0].dtype, wgrad_list)
                     _, grad_biases_, _ = grouped_gemm_wgrad(inputmats, grad_output, wgrad_list)
-                    # torch.cuda.synchronize()
-                    # print("====wgrad done=====")
-                    # print("wgrad_list:", wgrad_list)
                     for i in range(ctx.num_gemms):
                         if grad_biases[i] is None:
                             grad_biases[i] = grad_biases_[i]
