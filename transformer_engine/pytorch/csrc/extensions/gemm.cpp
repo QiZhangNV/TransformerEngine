@@ -321,8 +321,7 @@ void te_atomic_gemm(at::Tensor A, at::Tensor A_scale_inverse, DType A_type,
 std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     std::vector<py::handle> A, bool transa, std::vector<py::handle> B, bool transb,
     std::optional<std::vector<at::Tensor>> D, DType D_type, at::Tensor m_splits,
-    bool m_splits_on_devie,
-    std::vector<at::Tensor> bias, DType bias_type, bool single_output,
+    bool m_splits_on_devie, std::vector<at::Tensor> bias, DType bias_type, bool single_output,
     std::vector<at::Tensor> pre_gelu_out, bool grad, bool wgrad, std::vector<at::Tensor> workspace,
     size_t workspaceSize, bool accumulate, bool use_split_accumulator, int math_sm_count) {
   std::vector<NVTETensor> te_A_vector, te_B_vector, te_D_vector, te_bias_vector,
@@ -346,16 +345,18 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     output_data_ptr = (*D)[0].data_ptr();
   }
 
-  if (m_splits_on_devie) { // cutlass grouped gemm backend.
-    NVTE_CHECK(A.size() == 1, "A should not be splited when m_splits is not on CPU.");
+  if (m_splits_on_devie) {  // cutlass grouped gemm backend.
+    NVTE_CHECK(A.size() == 1,
+               "Grouped GEMM input A should not be splited when m_splits is on device.");
     auto te_A = makeTransformerEngineTensor(A[0], none);
-    
-   
 
-    if (!wgrad) { // fprop or dgrad
-      NVTE_CHECK(!transa, "Not implemented, A should not be transposed for fprop and dgrad when m_splits is not on CPU.");
-      NVTE_CHECK(single_output, "single_output=False is not supported for fprop and dgrad when m_splits is not on CPU.");
-    
+    if (!wgrad) {  // fprop or dgrad
+      NVTE_CHECK(!transa,
+                 "Not implemented, Grouped GEMM input A should not be transposed for fprop and "
+                 "dgrad when when m_splits is on device.");
+      NVTE_CHECK(single_output,
+                 "single_output=False is not supported for fprop and dgrad when when m_splits is "
+                 "on device.");
 
       te_A_vector.emplace_back(te_A.data());
       te_A_wrappers.emplace_back(std::move(te_A));
@@ -368,14 +369,16 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
         
         auto te_bias = makeTransformerEngineTensor(bias[i]);
         auto te_pre_gelu_out = makeTransformerEngineTensor(pre_gelu_out[i]);
-        const auto gelu_shape = pre_gelu_out[i].data_ptr() == nullptr
-                                    ? std::vector<size_t>{static_cast<size_t>(te_pre_gelu_out.size(0))}
-                                    : std::vector<size_t>{static_cast<size_t>(te_pre_gelu_out.size(0)),
-                                                          static_cast<size_t>(te_pre_gelu_out.size(1))};
+        const auto gelu_shape =
+            pre_gelu_out[i].data_ptr() == nullptr
+                ? std::vector<size_t>{static_cast<size_t>(te_pre_gelu_out.size(0))}
+                : std::vector<size_t>{static_cast<size_t>(te_pre_gelu_out.size(0)),
+                                      static_cast<size_t>(te_pre_gelu_out.size(1))};
 
         DType gelu_type = bias_type;
-        te_pre_gelu_out = makeTransformerEngineTensor(get_data_ptr(pre_gelu_out[i]), gelu_shape, gelu_type);
-        
+        te_pre_gelu_out =
+            makeTransformerEngineTensor(get_data_ptr(pre_gelu_out[i]), gelu_shape, gelu_type);
+
         te_B_vector.emplace_back(te_B.data());
         te_bias_vector.emplace_back(te_bias.data());
         te_pre_gelu_out_vector.emplace_back(te_pre_gelu_out.data());
@@ -395,22 +398,28 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       }
 
       auto wsp = makeTransformerEngineTensor(workspace[0].data_ptr(),
-                                            std::vector<size_t>{workspaceSize}, DType::kByte);
+                                             std::vector<size_t>{workspaceSize}, DType::kByte);
       te_workspace_vector.emplace_back(wsp.data());
       wrappers.emplace_back(std::move(wsp));
 
       NVTE_SCOPED_GIL_RELEASE({
         nvte_cutlass_grouped_gemm(te_A_vector.data(), te_B_vector.data(), te_D_vector.data(),
-                                    reinterpret_cast<int64_t *>(m_splits.data_ptr()),
-                                    te_bias_vector.data(), te_pre_gelu_out_vector.data(),
-                                    te_B_vector.size(), transa, transb, grad,
-                                    te_workspace_vector.data(), accumulate, use_split_accumulator,
-                                    math_sm_count, at::cuda::getCurrentCUDAStream());
+                                  reinterpret_cast<int64_t*>(m_splits.data_ptr()),
+                                  te_bias_vector.data(), te_pre_gelu_out_vector.data(),
+                                  te_B_vector.size(), transa, transb, grad,
+                                  te_workspace_vector.data(), accumulate, use_split_accumulator,
+                                  math_sm_count, at::cuda::getCurrentCUDAStream());
       });
-    } else { // wgrad
-      NVTE_CHECK(transa, "Not implemented, A should be transposed for wgrad when m_splits is not on CPU.");
-      NVTE_CHECK(!transb, "Not implemented, B should not be transposed for wgrad when m_splits is not on CPU.");
-      NVTE_CHECK(B.size() == 1, "B should not be splited for wgrad when m_splits is not on CPU.");
+    } else {  // wgrad
+      NVTE_CHECK(transa,
+                 "Not implemented, Grouped GEMM input A should be transposed for wgrad when "
+                 "m_splits is on device.");
+      NVTE_CHECK(!transb,
+                 "Not implemented, Grouped GEMM input B should not be transposed for wgrad when "
+                 "m_splits is on device.");
+      NVTE_CHECK(
+          B.size() == 1,
+          "Grouped GEMM input B should not be splited for wgrad when m_splits is on device.");
 
       te_A_vector.emplace_back(te_A.data());
       te_A_wrappers.emplace_back(std::move(te_A));
@@ -425,49 +434,53 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       // Keep the swizzled scaling factor tensors alive during the GEMMs.
       auto swizzled_scale_inv_B = multi_tensor_swizzle_scaling_factors(te_B_wrappers, transb);
 
-      
-      NVTE_CHECK(D != std::nullopt, "D should be allocated for wgrad when m_splits is not on CPU.");
+      NVTE_CHECK(D != std::nullopt,
+                 "Grouped GEMM output D should be allocated for wgrad when m_splits is on device.");
       // TODO: handle single_output case
-      NVTE_CHECK(!single_output, "Not implemented single output case for wgrad when m_splits is not on CPU.");
+      NVTE_CHECK(
+          !single_output,
+          "Not implemented, single output is not supported for wgrad when m_splits is on device.");
 
       for (size_t i = 0; i < (*D).size(); i++) {
         auto te_bias = makeTransformerEngineTensor(bias[i]);
         auto te_pre_gelu_out = makeTransformerEngineTensor(pre_gelu_out[i]);
-        const auto gelu_shape = pre_gelu_out[i].data_ptr() == nullptr
-                                    ? std::vector<size_t>{static_cast<size_t>(te_pre_gelu_out.size(0))}
-                                    : std::vector<size_t>{static_cast<size_t>(te_pre_gelu_out.size(0)),
-                                                          static_cast<size_t>(te_pre_gelu_out.size(1))};
+        const auto gelu_shape =
+            pre_gelu_out[i].data_ptr() == nullptr
+                ? std::vector<size_t>{static_cast<size_t>(te_pre_gelu_out.size(0))}
+                : std::vector<size_t>{static_cast<size_t>(te_pre_gelu_out.size(0)),
+                                      static_cast<size_t>(te_pre_gelu_out.size(1))};
 
         DType gelu_type = bias_type;
-        te_pre_gelu_out = makeTransformerEngineTensor(get_data_ptr(pre_gelu_out[i]), gelu_shape, gelu_type);
-        
+        te_pre_gelu_out =
+            makeTransformerEngineTensor(get_data_ptr(pre_gelu_out[i]), gelu_shape, gelu_type);
+
         te_bias_vector.emplace_back(te_bias.data());
         te_pre_gelu_out_vector.emplace_back(te_pre_gelu_out.data());
 
         wrappers.emplace_back(std::move(te_bias));
         wrappers.emplace_back(std::move(te_pre_gelu_out));
 
-        if(!single_output){
+        if (!single_output) {
           auto te_D = makeTransformerEngineTensor((*D)[i]);
           te_D_vector.emplace_back(te_D.data());
           wrappers.emplace_back(std::move(te_D));
         }
       }
-      
+
       auto wsp = makeTransformerEngineTensor(workspace[0].data_ptr(),
-                                            std::vector<size_t>{workspaceSize}, DType::kByte);
+                                             std::vector<size_t>{workspaceSize}, DType::kByte);
       te_workspace_vector.emplace_back(wsp.data());
       wrappers.emplace_back(std::move(wsp));
       NVTE_SCOPED_GIL_RELEASE({
-        nvte_cutlass_grouped_gemm_wgrad(te_A_vector.data(), te_B_vector.data(), te_D_vector.data(),
-                                      reinterpret_cast<int64_t *>(m_splits.data_ptr()),
-                                      te_bias_vector.data(), te_pre_gelu_out_vector.data(),
-                                      te_D_vector.size(), transa, transb,
-                                      te_workspace_vector.data(), accumulate, use_split_accumulator,
-                                      math_sm_count, at::cuda::getCurrentCUDAStream());
+        nvte_cutlass_grouped_gemm_wgrad(
+            te_A_vector.data(), te_B_vector.data(), te_D_vector.data(),
+            reinterpret_cast<int64_t*>(m_splits.data_ptr()), te_bias_vector.data(),
+            te_pre_gelu_out_vector.data(), te_D_vector.size(), transa, transb,
+            te_workspace_vector.data(), accumulate, use_split_accumulator, math_sm_count,
+            at::cuda::getCurrentCUDAStream());
       });
     }
-  } else { // multi-stream cublas backend.
+  } else {  // multi-stream cublas backend.
     for (size_t i = 0; i < A.size(); i++) {
       auto te_A = makeTransformerEngineTensor(A[i], none);
       auto te_B = makeTransformerEngineTensor(B[i], none);
@@ -524,10 +537,11 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       auto te_bias = makeTransformerEngineTensor(bias[i]);
       auto te_pre_gelu_out = makeTransformerEngineTensor(pre_gelu_out[i]);
 
-      const auto gelu_shape = pre_gelu_out[i].data_ptr() == nullptr
-                                  ? std::vector<size_t>{static_cast<size_t>(te_pre_gelu_out.size(0))}
-                                  : std::vector<size_t>{static_cast<size_t>(te_pre_gelu_out.size(0)),
-                                                        static_cast<size_t>(te_pre_gelu_out.size(1))};
+      const auto gelu_shape =
+          pre_gelu_out[i].data_ptr() == nullptr
+              ? std::vector<size_t>{static_cast<size_t>(te_pre_gelu_out.size(0))}
+              : std::vector<size_t>{static_cast<size_t>(te_pre_gelu_out.size(0)),
+                                    static_cast<size_t>(te_pre_gelu_out.size(1))};
 
       DType gelu_type = bias_type;
       te_pre_gelu_out =

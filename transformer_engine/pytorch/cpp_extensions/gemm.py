@@ -11,6 +11,7 @@ import transformer_engine_torch as tex
 from ..constants import TE_DType
 from ..utils import get_sm_count, _empty_tensor
 
+from ..tensor._internal.mxfp8_tensor_base import MXFP8TensorBase
 from ..tensor.quantized_tensor import Quantizer
 from ..tensor._internal.float8_blockwise_tensor_base import Float8BlockwiseQTensorBase
 from ...debug.pytorch.debug_quantization import DebugQuantizer
@@ -143,6 +144,13 @@ def general_grouped_gemm(
     # print("===========general_grouped_gemm===========")
     # print(f"layout: {layout}")
     num_gemms = m_splits.size(0)
+    if m_splits_on_devie:
+        assert isinstance(A[0], MXFP8TensorBase) and isinstance(B[0], MXFP8TensorBase), "Only MXFP8 A and B are supported when m_splits is on device"
+        assert out[0].dtype == torch.float16, "Only FP16 output is supported when m_splits is on device"
+        assert not use_bias, "Bias is not supported when m_splits is on device"
+        assert not gelu, "GELU is not supported when m_splits is on device"
+        # for i in range(num_gemms):
+        #     assert m_splits[i] % 128 == 0, "m_splits must be divisible by 128"
 
     transa = layout[0] == "T"
     transb = layout[1] == "T"
@@ -176,8 +184,6 @@ def general_grouped_gemm(
     # print("===========call tex.te_general_grouped_gemm===========")
     # print("A[0]:",  A[0].get_metadata_debug())
     # print("B[0]:",  B[0].get_metadata_debug())
-    # print("out[0]:",  out[0].shape, out[0])
-    # print("workspaces:", workspaces, "workspaces[0].shape[0]:", workspaces[0].shape[0])
     bias = tex.te_general_grouped_gemm(
         A,
         transa,
