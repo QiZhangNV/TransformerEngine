@@ -5,15 +5,16 @@
 cmake_minimum_required(VERSION 3.21)
 
 # Language options
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL 13.0)
-    set(CMAKE_CUDA_ARCHITECTURES 75 80 89 90 100 120)
-  elseif (CUDAToolkit_VERSION VERSION_GREATER_EQUAL 12.8)
-    set(CMAKE_CUDA_ARCHITECTURES 70 80 89 90 100 120)
-  else ()
-    set(CMAKE_CUDA_ARCHITECTURES 70 80 89 90)
-  endif()
-endif()
+# if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+#   if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL 13.0)
+#     set(CMAKE_CUDA_ARCHITECTURES 75 80 89 90 100 120)
+#   elseif (CUDAToolkit_VERSION VERSION_GREATER_EQUAL 12.8)
+#     set(CMAKE_CUDA_ARCHITECTURES 70 80 89 90 100 120)
+#   else ()
+#     set(CMAKE_CUDA_ARCHITECTURES 70 80 89 90)
+#   endif()
+# endif()
+set(CMAKE_CUDA_ARCHITECTURES 100a)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
@@ -44,6 +45,10 @@ if(NOT EXISTS "${CUDNN_FRONTEND_INCLUDE_DIR}")
             "within the Transformer Engine source.")
 endif()
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../3rdparty/cudnn-frontend/cmake/cuDNN.cmake)
+
+# CUTLASS
+set(CUTLASS_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../3rdparty/cutlass/include")
+set(CUTLASS_UTIL_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../3rdparty/cutlass/tools/util/include")
 
 # Python
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
@@ -80,6 +85,7 @@ list(APPEND transformer_engine_SOURCES
      fused_attn/fused_attn.cpp
      fused_attn/utils.cu
      gemm/cublaslt_gemm.cu
+     gemm/cutlass_gemm.cu
      normalization/common.cpp
      normalization/layernorm/ln_api.cpp
      normalization/layernorm/ln_bwd_semi_cuda_kernel.cu
@@ -124,6 +130,8 @@ target_link_libraries(transformer_engine PUBLIC
 target_include_directories(transformer_engine PRIVATE
                            ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 target_include_directories(transformer_engine PRIVATE "${CUDNN_FRONTEND_INCLUDE_DIR}")
+target_include_directories(transformer_engine PRIVATE "${CUTLASS_PATH}")
+target_include_directories(transformer_engine PRIVATE "${CUTLASS_UTIL_PATH}")
 
 # Compiling Userbuffers with native MPI bootstrapping requires linking against MPI
 option(NVTE_UB_WITH_MPI "Bootstrap Userbuffers with MPI" OFF)

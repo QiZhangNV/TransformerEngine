@@ -112,6 +112,17 @@ class MXFP8TensorBase(QuantizedTensorBase):
             "quantizer": self._quantizer,
         }
 
+    def get_metadata_debug(self) -> Dict[str, Any]:
+        """Get this tensor's metadata."""
+        return {
+            "rowwise_data": [self._rowwise_data, self._rowwise_data.shape if self._rowwise_data is not None else None],
+            "rowwise_scale_inv": [self._rowwise_scale_inv, self._rowwise_scale_inv.shape if self._rowwise_scale_inv is not None else None],
+            "columnwise_data": [self._columnwise_data, self._columnwise_data.shape if self._columnwise_data is not None else None],
+            "columnwise_scale_inv": [self._columnwise_scale_inv, self._columnwise_scale_inv.shape if self._columnwise_scale_inv is not None else None],
+            "fp8_dtype": self._fp8_dtype,
+            "quantizer": self._quantizer,
+        }
+        
     def prepare_for_saving(self) -> Tuple[list[Optional[torch.Tensor]], MXFP8TensorBase]:
         """Prepare the tensor base for saving for backward"""
         tensors = [

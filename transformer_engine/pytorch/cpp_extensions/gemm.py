@@ -125,9 +125,11 @@ def general_grouped_gemm(
     out_dtype: torch.dtype,
     workspaces: List[torch.Tensor],
     layout: str = "TN",
-    m_splits: Optional[List[int]] = None,
+    m_splits: Optional[torch.Tensor] = None,
+    m_splits_on_devie: bool = False,
     gelu: bool = False,
     grad=False,
+    wgrad=False,
     accumulate: bool = False,
     bias: Optional[List[torch.Tensor]] = None,
     use_bias: bool = False,
@@ -138,7 +140,9 @@ def general_grouped_gemm(
     """
     TN layout Grouped GEMM with fp8 inputs.
     """
-    num_gemms = len(A)
+    # print("===========general_grouped_gemm===========")
+    # print(f"layout: {layout}")
+    num_gemms = m_splits.size(0)
 
     transa = layout[0] == "T"
     transb = layout[1] == "T"
@@ -169,6 +173,11 @@ def general_grouped_gemm(
             for o in out
         ]  # this should differ with respect to single output
 
+    # print("===========call tex.te_general_grouped_gemm===========")
+    # print("A[0]:",  A[0].get_metadata_debug())
+    # print("B[0]:",  B[0].get_metadata_debug())
+    # print("out[0]:",  out[0].shape, out[0])
+    # print("workspaces:", workspaces, "workspaces[0].shape[0]:", workspaces[0].shape[0])
     bias = tex.te_general_grouped_gemm(
         A,
         transa,
@@ -177,11 +186,13 @@ def general_grouped_gemm(
         out,
         out_dtype,
         m_splits,
+        m_splits_on_devie,
         grad_bias if grad else bias,
         bias_dtype,
         single_output,
         gelu_input,  # this is pre_gelu_out
         grad,  # grad
+        wgrad,  # wgrad
         workspaces,
         workspaces[0].shape[0],
         accumulate,
