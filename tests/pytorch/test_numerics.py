@@ -1772,7 +1772,7 @@ def _test_grouped_linear_accuracy(
     return outputs
 
 
-@pytest.mark.parametrize("dtype", [torch.float16], ids=str)
+@pytest.mark.parametrize("dtype", [torch.bfloat16], ids=str)
 @pytest.mark.parametrize("num_gemms", [3, 6])
 @pytest.mark.parametrize("bs", batch_sizes)
 @pytest.mark.parametrize("model", ["126m"])

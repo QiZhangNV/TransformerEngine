@@ -86,7 +86,7 @@ void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, WeightType **B_list, Weight
   using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;  // <M,N,K> per group
   using ElementInput = cutlass::float_e4m3_t;  // Element type for Input matrix operands
   using ElementSF = cutlass::float_ue8m0_t;    // Element type for SF matrix operands
-  using ElementC = cutlass::half_t;
+  using ElementC = cutlass::bfloat16_t;
 
   using ElementA = cutlass::mx_float8_t<ElementInput>;  // Element type for A matrix operand
   using LayoutA = cutlass::layout::RowMajor;            // Layout type for A matrix operand
@@ -335,7 +335,7 @@ void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETen
   const transformer_engine::Tensor *outputD =
       convertNVTETensor(D[0]);
   NVTE_CHECK(outputD->has_data(), "Input D is missing row-wise usage");
-  half *outputD_ptr = reinterpret_cast<half *>(outputD->data.dptr);
+  __nv_bfloat16  *outputD_ptr = reinterpret_cast<__nv_bfloat16  *>(outputD->data.dptr);
 
   // Get GEMM shape
   const int gemm_k = transa ? inputA->flat_first_dim() : inputA->flat_last_dim();
@@ -350,7 +350,7 @@ void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETen
 
   if (transb) {
     generic_moe_gemm_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3, __nv_fp8_e8m0,
-                                    half, true>(
+                                    __nv_bfloat16 , true>(
         inputA_ptr, inputA_SF_ptr, inputB_ptr_list, inputB_SF_ptr_list, outputD_ptr,
         m_splits,  // gemm_m splits
         gemm_n,    // gemm_n
@@ -358,7 +358,7 @@ void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETen
         num_gemms, convertNVTETensor(workspace[0])->data.dptr, stream);
   } else {
     generic_moe_gemm_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3, __nv_fp8_e8m0,
-                                    half, false>(
+                                    __nv_bfloat16 , false>(
         inputA_ptr, inputA_SF_ptr, inputB_ptr_list, inputB_SF_ptr_list, outputD_ptr,
         m_splits,  // gemm_m splits
         gemm_n,    // gemm_n
@@ -392,7 +392,7 @@ __global__ void setGroupedGemmWgradArguments(
         problem_sizes[expert_id] = cute::make_shape(0, 0, 0);
         if (!accumulate_D) {
           for (int i = 0; i < gemm_m * gemm_n; i++) {
-            ptr_D_list[expert_id][i] = 0;
+            ptr_D_list[expert_id][i] = ElementD(0);
           }
         }
         continue;
@@ -444,7 +444,7 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
   using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;  // <M,N,K> per group
   using ElementInput = cutlass::float_e4m3_t;  // Element type for Input matrix operands
   using ElementSF = cutlass::float_ue8m0_t;    // Element type for SF matrix operands
-  using ElementC = cute::conditional_t<cute::is_same_v<OutputType, half>, cutlass::half_t, float>;
+  using ElementC = cute::conditional_t<cute::is_same_v<OutputType, __nv_bfloat16 >, cutlass::bfloat16_t, float>;
 
   using ElementA = cutlass::mx_float8_t<ElementInput>;  // Element type for A matrix operand
   using LayoutA = cutlass::layout::ColumnMajor;         // Layout type for A matrix operand
@@ -737,7 +737,7 @@ void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor *A, const NVTETensor *B, N
           convertNVTETensor(workspace[0])->data.dptr, stream);
     } else {
       generic_moe_gemm_wgrad_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3,
-                                            __nv_fp8_e8m0, half, true>(
+                                            __nv_fp8_e8m0, __nv_bfloat16 , true>(
           inputA_ptr, inputA_SF_ptr, inputB_ptr, inputB_SF_ptr, outputD_ptr_list, gemm_m, gemm_n,
           m_splits, total_gemm_k, num_gemms, accumulate,
           convertNVTETensor(workspace[0])->data.dptr, stream);
@@ -751,7 +751,7 @@ void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor *A, const NVTETensor *B, N
           convertNVTETensor(workspace[0])->data.dptr, stream);
     } else {
       generic_moe_gemm_wgrad_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3,
-                                            __nv_fp8_e8m0, half, false>(
+                                            __nv_fp8_e8m0, __nv_bfloat16 , false>(
           inputA_ptr, inputA_SF_ptr, inputB_ptr, inputB_SF_ptr, outputD_ptr_list, gemm_m, gemm_n,
           m_splits, total_gemm_k, num_gemms, accumulate,
           convertNVTETensor(workspace[0])->data.dptr, stream);

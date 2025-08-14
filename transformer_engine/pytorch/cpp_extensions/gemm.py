@@ -146,7 +146,7 @@ def general_grouped_gemm(
     num_gemms = m_splits.size(0)
     if m_splits_on_devie:
         assert isinstance(A[0], MXFP8TensorBase) and isinstance(B[0], MXFP8TensorBase), "Only MXFP8 A and B are supported when m_splits is on device"
-        assert out[0].dtype == torch.float16, "Only FP16 output is supported when m_splits is on device"
+        assert out[0].dtype == torch.bfloat16, "Only BF16 output is supported when m_splits is on device"
         assert not use_bias, "Bias is not supported when m_splits is on device"
         assert not gelu, "GELU is not supported when m_splits is on device"
         # for i in range(num_gemms):
