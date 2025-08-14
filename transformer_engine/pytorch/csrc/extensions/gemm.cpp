@@ -357,6 +357,13 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       NVTE_CHECK(single_output,
                  "single_output=False is not supported for fprop and dgrad when when m_splits is "
                  "on device.");
+      if (te_A.numel() == 0) {  // skip the GEMM
+        auto te_D = makeTransformerEngineTensor((*D)[0]);
+        if (te_D.numel() != 0) {
+          (*D)[0].zero_();
+        }
+        return bias;
+      }
 
       te_A_vector.emplace_back(te_A.data());
       te_A_wrappers.emplace_back(std::move(te_A));
@@ -366,7 +373,7 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
 
       for (size_t i = 0; i < B.size(); i++) {
         auto te_B = makeTransformerEngineTensor(B[i], none);
-        
+
         auto te_bias = makeTransformerEngineTensor(bias[i]);
         auto te_pre_gelu_out = makeTransformerEngineTensor(pre_gelu_out[i]);
         const auto gelu_shape =
@@ -420,6 +427,26 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       NVTE_CHECK(
           B.size() == 1,
           "Grouped GEMM input B should not be splited for wgrad when m_splits is on device.");
+      NVTE_CHECK(D != std::nullopt,
+                 "Grouped GEMM output D should be allocated for wgrad when m_splits is on device.");
+      // TODO: handle single_output case
+      NVTE_CHECK(
+          !single_output,
+          "Not implemented, single output is not supported for wgrad when m_splits is on device.");
+
+      auto te_B = makeTransformerEngineTensor(B[0], none);
+
+      if (te_A.numel() == 0 || te_B.numel() == 0) {  // skip the GEMM
+        if (!accumulate) {
+          for (size_t i = 0; i < (*D).size(); i++) {
+            auto te_D = makeTransformerEngineTensor((*D)[i]);
+            if (te_D.numel() != 0) {
+              (*D)[i].zero_();
+            }
+          }
+        }
+        return bias;
+      }
 
       te_A_vector.emplace_back(te_A.data());
       te_A_wrappers.emplace_back(std::move(te_A));
@@ -427,19 +454,11 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       // Keep the swizzled scaling factor tensors alive during the GEMMs.
       auto swizzled_scale_inv_A = multi_tensor_swizzle_scaling_factors(te_A_wrappers, !transa);
 
-      auto te_B = makeTransformerEngineTensor(B[0], none);
       te_B_vector.emplace_back(te_B.data());
       te_B_wrappers.emplace_back(std::move(te_B));
       // Optionally swizzle the scaling factors
       // Keep the swizzled scaling factor tensors alive during the GEMMs.
       auto swizzled_scale_inv_B = multi_tensor_swizzle_scaling_factors(te_B_wrappers, transb);
-
-      NVTE_CHECK(D != std::nullopt,
-                 "Grouped GEMM output D should be allocated for wgrad when m_splits is on device.");
-      // TODO: handle single_output case
-      NVTE_CHECK(
-          !single_output,
-          "Not implemented, single output is not supported for wgrad when m_splits is on device.");
 
       for (size_t i = 0; i < (*D).size(); i++) {
         auto te_bias = makeTransformerEngineTensor(bias[i]);
