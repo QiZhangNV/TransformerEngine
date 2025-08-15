@@ -407,7 +407,7 @@ class _GroupedLinear(torch.autograd.Function):
                         for w in weights
                     ]
                 if ctx.save_original_input:
-                    assert ctx.m_splits_on_devie, "save_original_input is not supported when m_splits is on host"
+                    assert not ctx.m_splits_on_devie, "save_original_input is not supported when m_splits is on device"
                     inp = inputmats[0]
                     in_features = inp.shape[-1]
                     inp_view = inp.reshape(-1, in_features)
