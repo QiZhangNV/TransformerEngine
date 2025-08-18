@@ -212,7 +212,7 @@ class _GroupedLinear(torch.autograd.Function):
             # TODO: update after #1638 is merged. # pylint: disable=fixme
             if weight_requires_grad:
                 if save_original_input:
-                    inputmats = [None] * num_gemms
+                    inputmats = [None] * num_gemms if not m_splits_on_devie else [None]
                     inputmats[0] = inp
                 else:
                     for inputmat in inputmats:
@@ -339,7 +339,12 @@ class _GroupedLinear(torch.autograd.Function):
                             ctx.grad_output_quantizers[:1],
                         )
             else:
-                grad_output = grad_output_mats
+                # Only split grad output. Grad bias is fused with
+                # wgrad GEMM.
+                grad_output = torch.split(
+                    cast_if_needed(grad_output_view, ctx.activation_dtype),
+                    ctx.m_splits,
+                )
 
             if ctx.is_first_microbatch is not None:
                 accumulate_wgrad_into_param_main_grad = (
@@ -407,7 +412,6 @@ class _GroupedLinear(torch.autograd.Function):
                         for w in weights
                     ]
                 if ctx.save_original_input:
-                    assert not ctx.m_splits_on_devie, "save_original_input is not supported when m_splits is on device"
                     inp = inputmats[0]
                     in_features = inp.shape[-1]
                     inp_view = inp.reshape(-1, in_features)
@@ -420,12 +424,17 @@ class _GroupedLinear(torch.autograd.Function):
                             else:
                                 input_quantizer.set_usage(rowwise=False, columnwise=True)
                     inputmats: list
-                    if ctx.fp8:
-                        inputmats = tex.split_quantize(inp_view, ctx.m_splits, ctx.input_quantizers)
+                    if not ctx.m_splits_on_devie:
+                        if ctx.fp8:
+                            inputmats = tex.split_quantize(inp_view, ctx.m_splits.tolist(), ctx.input_quantizers)
+                        else:
+                            inputmats = torch.split(
+                                cast_if_needed(inp_view, ctx.activation_dtype), ctx.m_splits
+                            )
                     else:
-                        inputmats = torch.split(
-                            cast_if_needed(inp_view, ctx.activation_dtype), ctx.m_splits
-                        )
+                        assert ctx.fp8, "Only MXFP8 is supported when m_splits is on devie"
+                        # Cannot split because the m_splits is not available on host.
+                        inputmats = tex.split_quantize(inp_view, [inp_view.size(0)], ctx.input_quantizers[:1])
                 grouped_gemm_wgrad = functools.partial(
                     general_grouped_gemm,
                     out_dtype=ctx.activation_dtype,
