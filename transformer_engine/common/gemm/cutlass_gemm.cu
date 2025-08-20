@@ -133,8 +133,9 @@ void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, WeightType **B_list, Weight
 
   using CollectiveEpilogue2SM = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag, EpilogueOperatorClass, typename MMA2SMConfig::MmaTileShape, ClusterShape,
-      Shape<_128, _64>, ElementAccumulator, ElementAccumulator, ElementC, LayoutC *, AlignmentC,
-      ElementD, LayoutC *, AlignmentD, typename MMA2SMConfig::EpilogueSchedule
+      cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator, void,
+      LayoutC *, AlignmentC, ElementD, LayoutC *, AlignmentD,
+      typename MMA2SMConfig::EpilogueSchedule
       // , FusionOperation  // Enable for SF Output
       >::CollectiveOp;
   using CollectiveMainloop2SM = typename cutlass::gemm::collective::CollectiveBuilder<
@@ -222,8 +223,8 @@ void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, WeightType **B_list, Weight
   offset = get_aligned_offset(offset + num_experts * sizeof(LayoutSFB), 128);
 
   ProblemShape::UnderlyingProblemShape *problem_sizes =
-      reinterpret_cast<ProblemShape::UnderlyingProblemShape *>(
-          reinterpret_cast<char *>(workspace) + offset);
+      reinterpret_cast<ProblemShape::UnderlyingProblemShape *>(reinterpret_cast<char *>(workspace) +
+                                                               offset);
   offset =
       get_aligned_offset(offset + num_experts * sizeof(ProblemShape::UnderlyingProblemShape), 128);
 
@@ -271,8 +272,7 @@ void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, WeightType **B_list, Weight
        layout_SFA_list,
        const_cast<const typename GemmGrouped::GemmKernel::ElementSF **>(ptr_SFB_list),
        layout_SFB_list},
-      {fusion_args, const_cast<const typename GemmGrouped::ElementD **>(ptr_D_list), stride_D_list,
-       ptr_D_list, stride_D_list},
+      {fusion_args, nullptr, stride_D_list, ptr_D_list, stride_D_list},
       hw_info,
       scheduler};
 
@@ -293,7 +293,7 @@ void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, WeightType **B_list, Weight
     throw std::runtime_error("[FT Error][MoE Runner] " + err_msg);
   }
 
-  auto init_status = gemm.initialize(args, reinterpret_cast<char *>(workspace + offset));
+  auto init_status = gemm.initialize(args, reinterpret_cast<char *>(workspace) + offset);
   if (init_status != cutlass::Status::kSuccess) {
     std::string err_msg = "Failed to initialize cutlass grouped gemm. Error: " +
                           std::string(cutlassGetStatusString(init_status));
@@ -407,7 +407,7 @@ __global__ void setGroupedGemmWgradArguments(
   if (threadIdx.x == 0 && blockIdx.x == 0) {
     for (int expert_id = 0; expert_id < num_experts; expert_id++) {
       int gemm_k = int(gemm_k_per_expert[expert_id]);
-      if (gemm_k == 0) {  // TODO: Debug why CUTLASS kernel cannot handle gemm_k = 0
+      if (gemm_k == 0) {
         // If gemm_k is 0, we need to set the problem_sizes to 0, 0, 0 to skip the gemm
         problem_sizes[expert_id] = cute::make_shape(0, 0, 0);
         if (!accumulate_D) {
@@ -512,8 +512,9 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
 
   using CollectiveEpilogue2SM = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag, EpilogueOperatorClass, typename MMA2SMConfig::MmaTileShape, ClusterShape,
-      Shape<_128, _64>, ElementAccumulator, ElementAccumulator, ElementC, LayoutC *, AlignmentC,
-      ElementD, LayoutC *, AlignmentD, typename MMA2SMConfig::EpilogueSchedule
+      cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator,
+      ElementC, LayoutC *, AlignmentC, ElementD, LayoutC *, AlignmentD,
+      typename MMA2SMConfig::EpilogueSchedule
       // , FusionOperation  // Enable for SF Output
       >::CollectiveOp;
   using CollectiveMainloop2SM = typename cutlass::gemm::collective::CollectiveBuilder<
@@ -598,8 +599,8 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
   offset = get_aligned_offset(offset + num_experts * sizeof(LayoutSFB), 128);
 
   ProblemShape::UnderlyingProblemShape *problem_sizes =
-      reinterpret_cast<ProblemShape::UnderlyingProblemShape *>(
-          reinterpret_cast<char *>(workspace) + offset);
+      reinterpret_cast<ProblemShape::UnderlyingProblemShape *>(reinterpret_cast<char *>(workspace) +
+                                                               offset);
   offset =
       get_aligned_offset(offset + num_experts * sizeof(ProblemShape::UnderlyingProblemShape), 128);
 
@@ -656,8 +657,9 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
        layout_SFA_list,
        const_cast<const typename GemmGrouped::GemmKernel::ElementSF **>(ptr_SFB_list),
        layout_SFB_list},
-      {fusion_args, const_cast<const typename GemmGrouped::ElementC **>(ptr_D_list), stride_D_list,
-       ptr_D_list, stride_D_list},
+      {fusion_args,
+       accumulate_D ? const_cast<const typename GemmGrouped::ElementC **>(ptr_D_list) : nullptr,
+       stride_D_list, ptr_D_list, stride_D_list},
       hw_info,
       scheduler};
 
@@ -678,7 +680,7 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
     throw std::runtime_error("[FT Error][MoE Runner] " + err_msg);
   }
 
-  auto init_status = gemm.initialize(args, reinterpret_cast<char *>(workspace + offset));
+  auto init_status = gemm.initialize(args, reinterpret_cast<char *>(workspace) + offset);
   if (init_status != cutlass::Status::kSuccess) {
     std::string err_msg = "Failed to initialize cutlass grouped gemm. Error: " +
                           std::string(cutlassGetStatusString(init_status));
