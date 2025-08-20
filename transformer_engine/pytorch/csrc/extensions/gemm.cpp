@@ -410,12 +410,12 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       wrappers.emplace_back(std::move(wsp));
 
       NVTE_SCOPED_GIL_RELEASE({
-        nvte_cutlass_grouped_gemm(te_A_vector.data(), te_B_vector.data(), te_D_vector.data(),
-                                  reinterpret_cast<int64_t*>(m_splits.data_ptr()),
-                                  te_bias_vector.data(), te_pre_gelu_out_vector.data(),
-                                  te_B_vector.size(), transa, transb, grad,
-                                  te_workspace_vector.data(), accumulate, use_split_accumulator,
-                                  math_sm_count, at::cuda::getCurrentCUDAStream());
+        nvte_cutlass_grouped_gemm(
+            te_A_vector.data(), te_B_vector.data(), te_D_vector.data(),
+            reinterpret_cast<int64_t*>(m_splits.data_ptr()), te_bias_vector.data(),
+            te_pre_gelu_out_vector.data(), te_B_vector.size(), transa, transb, grad,
+            te_workspace_vector.data(), workspaceSize, accumulate, use_split_accumulator,
+            math_sm_count, at::cuda::getCurrentCUDAStream());
       });
     } else {  // wgrad
       NVTE_CHECK(transa,
@@ -495,8 +495,8 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
             te_A_vector.data(), te_B_vector.data(), te_D_vector.data(),
             reinterpret_cast<int64_t*>(m_splits.data_ptr()), te_bias_vector.data(),
             te_pre_gelu_out_vector.data(), te_D_vector.size(), transa, transb,
-            te_workspace_vector.data(), accumulate, use_split_accumulator, math_sm_count,
-            at::cuda::getCurrentCUDAStream());
+            te_workspace_vector.data(), workspaceSize, accumulate, use_split_accumulator,
+            math_sm_count, at::cuda::getCurrentCUDAStream());
       });
     }
   } else {  // multi-stream cublas backend.

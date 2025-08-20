@@ -81,8 +81,9 @@ template <typename T, typename TSF, typename WeightType, typename WeightTypeSF, 
           bool TransB>
 void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, WeightType **B_list, WeightTypeSF **SFB_list,
                                      OutputType *D, const int64_t *gemm_m_per_expert, int gemm_n,
-                                     int gemm_k, int num_experts, void *workspace_args,
-                                     cudaStream_t stream, int *kernel_occupancy = nullptr) {
+                                     int gemm_k, int num_experts, size_t workspaceSize,
+                                     void *workspace, cudaStream_t stream,
+                                     int *kernel_occupancy = nullptr) {
   using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;  // <M,N,K> per group
   using ElementInput = cutlass::float_e4m3_t;  // Element type for Input matrix operands
   using ElementSF = cutlass::float_ue8m0_t;    // Element type for SF matrix operands
@@ -123,7 +124,7 @@ void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, WeightType **B_list, Weight
   using ClusterShape = Shape<int32_t, int32_t, _1>;
 
   struct MMA2SMConfig {
-    using MmaTileShape = Shape<_256, _128, _128>;
+    using MmaTileShape = Shape<_256, _256, _128>;
     using KernelSchedule =
         cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmMxf8f6f4Sm100;  // Kernel to launch
     using EpilogueSchedule =
@@ -158,52 +159,73 @@ void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, WeightType **B_list, Weight
 
   using RasterOrderOptions = cutlass::gemm::kernel::detail::RasterOrderOptions;
 
+  auto get_aligned_offset = [](size_t current_offset, size_t alignment) -> size_t {
+    return (current_offset + alignment - 1) & ~(alignment - 1);
+  };
+
+  if (workspace == nullptr) {
+    throw std::runtime_error("[FT Error][MoE Runner] workspace is null");
+  }
+
   size_t offset = 0;
   typename GemmGrouped::ElementA *ptr_A = reinterpret_cast<typename GemmGrouped::ElementA *>(A);
   typename GemmGrouped::ElementA **ptr_A_list = reinterpret_cast<typename GemmGrouped::ElementA **>(
-      reinterpret_cast<char *>(workspace_args) + offset);
-  offset += num_experts * sizeof(typename GemmGrouped::ElementA *);
+      reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(offset + num_experts * sizeof(typename GemmGrouped::ElementA *), 128);
 
-  typename GemmGrouped::ElementB **ptr_B_list =
-      reinterpret_cast<typename GemmGrouped::ElementB **>(B_list);
+  typename GemmGrouped::ElementB **ptr_B_list = reinterpret_cast<typename GemmGrouped::ElementB **>(
+      reinterpret_cast<char *>(workspace) + offset);
+  cudaMemcpyAsync(ptr_B_list, B_list, num_experts * sizeof(typename GemmGrouped::ElementB *),
+                  cudaMemcpyHostToDevice, stream);
+  offset = get_aligned_offset(offset + num_experts * sizeof(typename GemmGrouped::ElementB *), 128);
 
   typename GemmGrouped::ElementD *ptr_D = reinterpret_cast<typename GemmGrouped::ElementD *>(D);
   typename GemmGrouped::ElementD **ptr_D_list = reinterpret_cast<typename GemmGrouped::ElementD **>(
-      reinterpret_cast<char *>(workspace_args) + offset);
-  offset += num_experts * sizeof(typename GemmGrouped::ElementD *);
+      reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(offset + num_experts * sizeof(typename GemmGrouped::ElementD *), 128);
 
   typename GemmGrouped::GemmKernel::ElementSF *ptr_SFA =
       reinterpret_cast<typename GemmGrouped::GemmKernel::ElementSF *>(SFA);
   typename GemmGrouped::GemmKernel::ElementSF **ptr_SFA_list =
       reinterpret_cast<typename GemmGrouped::GemmKernel::ElementSF **>(
-          reinterpret_cast<char *>(workspace_args) + offset);
-  offset += num_experts * sizeof(typename GemmGrouped::GemmKernel::ElementSF *);
+          reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(
+      offset + num_experts * sizeof(typename GemmGrouped::GemmKernel::ElementSF *), 128);
 
   typename GemmGrouped::GemmKernel::ElementSF **ptr_SFB_list =
-      reinterpret_cast<typename GemmGrouped::GemmKernel::ElementSF **>(SFB_list);
+      reinterpret_cast<typename GemmGrouped::GemmKernel::ElementSF **>(
+          reinterpret_cast<char *>(workspace) + offset);
+  cudaMemcpyAsync(ptr_SFB_list, SFB_list,
+                  num_experts * sizeof(typename GemmGrouped::GemmKernel::ElementSF *),
+                  cudaMemcpyHostToDevice, stream);
+  offset = get_aligned_offset(
+      offset + num_experts * sizeof(typename GemmGrouped::GemmKernel::ElementSF *), 128);
 
   StrideA *stride_A_list =
-      reinterpret_cast<StrideA *>(reinterpret_cast<char *>(workspace_args) + offset);
-  offset += num_experts * sizeof(StrideA);
+      reinterpret_cast<StrideA *>(reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(offset + num_experts * sizeof(StrideA), 128);
+
   StrideB *stride_B_list =
-      reinterpret_cast<StrideB *>(reinterpret_cast<char *>(workspace_args) + offset);
-  offset += num_experts * sizeof(StrideB);
+      reinterpret_cast<StrideB *>(reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(offset + num_experts * sizeof(StrideB), 128);
+
   StrideD *stride_D_list =
-      reinterpret_cast<StrideD *>(reinterpret_cast<char *>(workspace_args) + offset);
-  offset += num_experts * sizeof(StrideD);
+      reinterpret_cast<StrideD *>(reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(offset + num_experts * sizeof(StrideD), 128);
 
   LayoutSFA *layout_SFA_list =
-      reinterpret_cast<LayoutSFA *>(reinterpret_cast<char *>(workspace_args) + offset);
-  offset += num_experts * sizeof(LayoutSFA);
+      reinterpret_cast<LayoutSFA *>(reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(offset + num_experts * sizeof(LayoutSFA), 128);
+
   LayoutSFB *layout_SFB_list =
-      reinterpret_cast<LayoutSFB *>(reinterpret_cast<char *>(workspace_args) + offset);
-  offset += num_experts * sizeof(LayoutSFB);
+      reinterpret_cast<LayoutSFB *>(reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(offset + num_experts * sizeof(LayoutSFB), 128);
 
   ProblemShape::UnderlyingProblemShape *problem_sizes =
       reinterpret_cast<ProblemShape::UnderlyingProblemShape *>(
-          reinterpret_cast<char *>(workspace_args) + offset);
-  offset += num_experts * sizeof(ProblemShape::UnderlyingProblemShape);
-  // printf("total malloc size: %d\n", offset);
+          reinterpret_cast<char *>(workspace) + offset);
+  offset =
+      get_aligned_offset(offset + num_experts * sizeof(ProblemShape::UnderlyingProblemShape), 128);
 
   setGroupedGemmArguments<Sm1xxBlkScaledConfig, ProblemShape::UnderlyingProblemShape,
                           typename GemmGrouped::ElementA, typename GemmGrouped::ElementD,
@@ -233,7 +255,7 @@ void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, WeightType **B_list, Weight
       cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
   if (!is_static_v<ClusterShape>) {
-    hw_info.cluster_shape = dim3(2, 1, 1);
+    hw_info.cluster_shape = dim3(4, 4, 1);
     hw_info.cluster_shape_fallback = dim3(2, 1, 1);
   }
 
@@ -258,10 +280,11 @@ void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, WeightType **B_list, Weight
 
   // Using the arguments, query for extra workspace required for matrix multiplication computation
   size_t workspace_size = GemmGrouped::get_workspace_size(args);
-  // printf("workspace_size: %d\n", workspace_size);
-  // Allocate workspace memory
-  cutlass::device_memory::allocation<uint8_t> workspace(
-      workspace_size);  // TODO: use workspace_args to remove cudaMalloc, shuold debug misaligned address
+  if (workspaceSize < offset + workspace_size) {  // 16MB limit
+    throw std::runtime_error("Calculated workspace size (" +
+                             std::to_string(offset + workspace_size) + ") exceeds buffer size (" +
+                             std::to_string(workspaceSize) + ")\n");
+  }
 
   auto can_implement = gemm.can_implement(args);
   if (can_implement != cutlass::Status::kSuccess) {
@@ -270,7 +293,7 @@ void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, WeightType **B_list, Weight
     throw std::runtime_error("[FT Error][MoE Runner] " + err_msg);
   }
 
-  auto init_status = gemm.initialize(args, workspace.get());
+  auto init_status = gemm.initialize(args, reinterpret_cast<char *>(workspace + offset));
   if (init_status != cutlass::Status::kSuccess) {
     std::string err_msg = "Failed to initialize cutlass grouped gemm. Error: " +
                           std::string(cutlassGetStatusString(init_status));
@@ -290,17 +313,17 @@ void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, WeightType **B_list, Weight
 void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor *D,
                                const int64_t *m_splits, const NVTETensor *bias,
                                NVTETensor *pre_gelu_out, const int num_gemms, bool transa,
-                               bool transb, bool grad, NVTETensor *workspace, bool accumulate,
-                               bool use_split_accumulator, int math_sm_count, cudaStream_t stream) {
+                               bool transb, bool grad, NVTETensor *workspace, size_t workspaceSize,
+                               bool accumulate, bool use_split_accumulator, int math_sm_count,
+                               cudaStream_t stream) {
   NVTE_API_CALL(nvte_cutlass_grouped_gemm);
   using namespace transformer_engine;
-  //   printf("===========nvte_cutlass_grouped_gemm===========\n");
-  //   printf("transa: %d, transb: %d\n", transa, transb);
-  //   printf("grad: %d\n", grad);
+  // printf("===========nvte_cutlass_grouped_gemm===========\n");
+  // printf("transa: %d, transb: %d\n", transa, transb);
+  // printf("grad: %d\n", grad);
 
   // Process A
-  const transformer_engine::Tensor *inputA =
-      convertNVTETensor(A[0]);
+  const transformer_engine::Tensor *inputA = convertNVTETensor(A[0]);
   if (transa) {
     NVTE_CHECK(inputA->has_columnwise_data(), "Input A is missing column-wise usage");
   } else {
@@ -317,8 +340,7 @@ void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETen
   __nv_fp8_e4m3 *inputB_ptr_list[num_gemms];
   __nv_fp8_e8m0 *inputB_SF_ptr_list[num_gemms];
   for (size_t i = 0; i < num_gemms; i++) {
-    const transformer_engine::Tensor *inputB =
-        convertNVTETensor(B[i]);
+    const transformer_engine::Tensor *inputB = convertNVTETensor(B[i]);
     if (transb) {
       NVTE_CHECK(inputB->has_data(), "Input B is missing row-wise usage");
     } else {
@@ -332,16 +354,14 @@ void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETen
   }
 
   // Process D
-  const transformer_engine::Tensor *outputD =
-      convertNVTETensor(D[0]);
+  const transformer_engine::Tensor *outputD = convertNVTETensor(D[0]);
   NVTE_CHECK(outputD->has_data(), "Input D is missing row-wise usage");
-  __nv_bfloat16  *outputD_ptr = reinterpret_cast<__nv_bfloat16  *>(outputD->data.dptr);
+  __nv_bfloat16 *outputD_ptr = reinterpret_cast<__nv_bfloat16 *>(outputD->data.dptr);
 
   // Get GEMM shape
   const int gemm_k = transa ? inputA->flat_first_dim() : inputA->flat_last_dim();
   const int gemm_n =
-      transb ? convertNVTETensor(B[0])->flat_first_dim()
-             : convertNVTETensor(B[0])->flat_last_dim();
+      transb ? convertNVTETensor(B[0])->flat_first_dim() : convertNVTETensor(B[0])->flat_last_dim();
   //   printf("num_gemms: %d\n", num_gemms);
   //   printf("gemm_n: %d, gemm_k: %d\n", gemm_n, gemm_k);
   if ((gemm_k & 0x1F) != 0) {
@@ -350,20 +370,20 @@ void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETen
 
   if (transb) {
     generic_moe_gemm_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3, __nv_fp8_e8m0,
-                                    __nv_bfloat16 , true>(
+                                    __nv_bfloat16, true>(
         inputA_ptr, inputA_SF_ptr, inputB_ptr_list, inputB_SF_ptr_list, outputD_ptr,
         m_splits,  // gemm_m splits
         gemm_n,    // gemm_n
         gemm_k,    // gemm_k
-        num_gemms, convertNVTETensor(workspace[0])->data.dptr, stream);
+        num_gemms, workspaceSize, convertNVTETensor(workspace[0])->data.dptr, stream);
   } else {
     generic_moe_gemm_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3, __nv_fp8_e8m0,
-                                    __nv_bfloat16 , false>(
+                                    __nv_bfloat16, false>(
         inputA_ptr, inputA_SF_ptr, inputB_ptr_list, inputB_SF_ptr_list, outputD_ptr,
         m_splits,  // gemm_m splits
         gemm_n,    // gemm_n
         gemm_k,    // gemm_k
-        num_gemms, convertNVTETensor(workspace[0])->data.dptr, stream);
+        num_gemms, workspaceSize, convertNVTETensor(workspace[0])->data.dptr, stream);
   }
 }
 
@@ -439,12 +459,14 @@ template <typename T, typename TSF, typename WeightType, typename WeightTypeSF, 
 void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, WeightTypeSF *SFB,
                                            void **D_list, int gemm_m, int gemm_n,
                                            const int64_t *gemm_k_per_expert, int total_gemm_k,
-                                           int num_experts, bool accumulate_D, void *workspace_args,
-                                           cudaStream_t stream, int *kernel_occupancy = nullptr) {
+                                           int num_experts, bool accumulate_D, size_t workspaceSize,
+                                           void *workspace, cudaStream_t stream,
+                                           int *kernel_occupancy = nullptr) {
   using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;  // <M,N,K> per group
   using ElementInput = cutlass::float_e4m3_t;  // Element type for Input matrix operands
   using ElementSF = cutlass::float_ue8m0_t;    // Element type for SF matrix operands
-  using ElementC = cute::conditional_t<cute::is_same_v<OutputType, __nv_bfloat16 >, cutlass::bfloat16_t, float>;
+  using ElementC =
+      cute::conditional_t<cute::is_same_v<OutputType, __nv_bfloat16>, cutlass::bfloat16_t, float>;
 
   using ElementA = cutlass::mx_float8_t<ElementInput>;  // Element type for A matrix operand
   using LayoutA = cutlass::layout::ColumnMajor;         // Layout type for A matrix operand
@@ -481,7 +503,7 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
   using ClusterShape = Shape<int32_t, int32_t, _1>;
 
   struct MMA2SMConfig {
-    using MmaTileShape = Shape<_256, _128, _128>;
+    using MmaTileShape = Shape<_256, _256, _128>;
     using KernelSchedule =
         cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmMxf8f6f4Sm100;  // Kernel to launch
     using EpilogueSchedule =
@@ -516,56 +538,71 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
 
   using RasterOrderOptions = cutlass::gemm::kernel::detail::RasterOrderOptions;
 
+  // Helper function to calculate aligned offset
+  auto get_aligned_offset = [](int current_offset, int alignment) -> int {
+    return (current_offset + alignment - 1) & ~(alignment - 1);
+  };
+
+  if (workspace == nullptr) {
+    throw std::runtime_error("[FT Error][MoE Runner] workspace is null");
+  }
+
   int offset = 0;
   typename GemmGrouped::ElementA *ptr_A = reinterpret_cast<typename GemmGrouped::ElementA *>(A);
   typename GemmGrouped::ElementA **ptr_A_list = reinterpret_cast<typename GemmGrouped::ElementA **>(
-      reinterpret_cast<char *>(workspace_args) + offset);
-  offset += num_experts * sizeof(typename GemmGrouped::ElementA *);
+      reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(offset + num_experts * sizeof(typename GemmGrouped::ElementA *), 128);
 
   typename GemmGrouped::ElementB *ptr_B = reinterpret_cast<typename GemmGrouped::ElementB *>(B);
   typename GemmGrouped::ElementB **ptr_B_list = reinterpret_cast<typename GemmGrouped::ElementB **>(
-      reinterpret_cast<char *>(workspace_args) + offset);
-  offset += num_experts * sizeof(typename GemmGrouped::ElementB *);
+      reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(offset + num_experts * sizeof(typename GemmGrouped::ElementB *), 128);
 
-  typename GemmGrouped::ElementD **ptr_D_list =
-      reinterpret_cast<typename GemmGrouped::ElementD **>(D_list);
+  typename GemmGrouped::ElementD **ptr_D_list = reinterpret_cast<typename GemmGrouped::ElementD **>(
+      reinterpret_cast<char *>(workspace) + offset);
+  cudaMemcpyAsync(ptr_D_list, D_list, num_experts * sizeof(typename GemmGrouped::ElementD *),
+                  cudaMemcpyHostToDevice, stream);
+  offset = get_aligned_offset(offset + num_experts * sizeof(typename GemmGrouped::ElementD *), 128);
 
   typename GemmGrouped::GemmKernel::ElementSF *ptr_SFA =
       reinterpret_cast<typename GemmGrouped::GemmKernel::ElementSF *>(SFA);
   typename GemmGrouped::GemmKernel::ElementSF **ptr_SFA_list =
       reinterpret_cast<typename GemmGrouped::GemmKernel::ElementSF **>(
-          reinterpret_cast<char *>(workspace_args) + offset);
-  offset += num_experts * sizeof(typename GemmGrouped::GemmKernel::ElementSF *);
+          reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(
+      offset + num_experts * sizeof(typename GemmGrouped::GemmKernel::ElementSF *), 128);
 
   typename GemmGrouped::GemmKernel::ElementSF *ptr_SFB =
       reinterpret_cast<typename GemmGrouped::GemmKernel::ElementSF *>(SFB);
   typename GemmGrouped::GemmKernel::ElementSF **ptr_SFB_list =
       reinterpret_cast<typename GemmGrouped::GemmKernel::ElementSF **>(
-          reinterpret_cast<char *>(workspace_args) + offset);
-  offset += num_experts * sizeof(typename GemmGrouped::GemmKernel::ElementSF *);
+          reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(
+      offset + num_experts * sizeof(typename GemmGrouped::GemmKernel::ElementSF *), 128);
 
   StrideA *stride_A_list =
-      reinterpret_cast<StrideA *>(reinterpret_cast<char *>(workspace_args) + offset);
-  offset += num_experts * sizeof(StrideA);
+      reinterpret_cast<StrideA *>(reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(offset + num_experts * sizeof(StrideA), 128);
   StrideB *stride_B_list =
-      reinterpret_cast<StrideB *>(reinterpret_cast<char *>(workspace_args) + offset);
-  offset += num_experts * sizeof(StrideB);
+      reinterpret_cast<StrideB *>(reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(offset + num_experts * sizeof(StrideB), 128);
   StrideD *stride_D_list =
-      reinterpret_cast<StrideD *>(reinterpret_cast<char *>(workspace_args) + offset);
-  offset += num_experts * sizeof(StrideD);
+      reinterpret_cast<StrideD *>(reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(offset + num_experts * sizeof(StrideD), 128);
 
   LayoutSFA *layout_SFA_list =
-      reinterpret_cast<LayoutSFA *>(reinterpret_cast<char *>(workspace_args) + offset);
-  offset += num_experts * sizeof(LayoutSFA);
+      reinterpret_cast<LayoutSFA *>(reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(offset + num_experts * sizeof(LayoutSFA), 128);
   LayoutSFB *layout_SFB_list =
-      reinterpret_cast<LayoutSFB *>(reinterpret_cast<char *>(workspace_args) + offset);
-  offset += num_experts * sizeof(LayoutSFB);
+      reinterpret_cast<LayoutSFB *>(reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(offset + num_experts * sizeof(LayoutSFB), 128);
 
   ProblemShape::UnderlyingProblemShape *problem_sizes =
       reinterpret_cast<ProblemShape::UnderlyingProblemShape *>(
-          reinterpret_cast<char *>(workspace_args) + offset);
-  offset += num_experts * sizeof(ProblemShape::UnderlyingProblemShape);
-  // printf("total malloc size: %d\n", offset);
+          reinterpret_cast<char *>(workspace) + offset);
+  offset =
+      get_aligned_offset(offset + num_experts * sizeof(ProblemShape::UnderlyingProblemShape), 128);
+
   setGroupedGemmWgradArguments<Sm1xxBlkScaledConfig, ProblemShape::UnderlyingProblemShape,
                                typename GemmGrouped::ElementA, typename GemmGrouped::ElementB,
                                typename GemmGrouped::ElementD,
@@ -603,7 +640,7 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
       cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
   if (!is_static_v<ClusterShape>) {
-    hw_info.cluster_shape = dim3(2, 1, 1);
+    hw_info.cluster_shape = dim3(4, 4, 1);
     hw_info.cluster_shape_fallback = dim3(2, 1, 1);
   }
 
@@ -628,10 +665,11 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
 
   // Using the arguments, query for extra workspace required for matrix multiplication computation
   size_t workspace_size = GemmGrouped::get_workspace_size(args);
-  // printf("workspace_size: %d\n", workspace_size);
-  // Allocate workspace memory
-  cutlass::device_memory::allocation<uint8_t> workspace(
-      workspace_size);  // TODO: use workspace_args to remove cudaMalloc, shuold debug misaligned address
+  if (workspaceSize < offset + workspace_size) {  // 16MB limit
+    throw std::runtime_error("Calculated workspace size (" +
+                             std::to_string(offset + workspace_size) + ") exceeds buffer size (" +
+                             std::to_string(workspaceSize) + ")\n");
+  }
 
   auto can_implement = gemm.can_implement(args);
   if (can_implement != cutlass::Status::kSuccess) {
@@ -640,7 +678,7 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
     throw std::runtime_error("[FT Error][MoE Runner] " + err_msg);
   }
 
-  auto init_status = gemm.initialize(args, workspace.get());
+  auto init_status = gemm.initialize(args, reinterpret_cast<char *>(workspace + offset));
   if (init_status != cutlass::Status::kSuccess) {
     std::string err_msg = "Failed to initialize cutlass grouped gemm. Error: " +
                           std::string(cutlassGetStatusString(init_status));
@@ -658,8 +696,8 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
 void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor *A, const NVTETensor *B, NVTETensor *D,
                                      const int64_t *m_splits, const NVTETensor *bias,
                                      NVTETensor *pre_gelu_out, const int num_gemms, bool transa,
-                                     bool transb, NVTETensor *workspace, bool accumulate,
-                                     bool use_split_accumulator, int math_sm_count,
+                                     bool transb, NVTETensor *workspace, size_t workspaceSize,
+                                     bool accumulate, bool use_split_accumulator, int math_sm_count,
                                      cudaStream_t stream) {
   NVTE_API_CALL(nvte_cutlass_grouped_gemm_wgrad);
   using namespace transformer_engine;
@@ -669,8 +707,7 @@ void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor *A, const NVTETensor *B, N
   NVTE_CHECK(transa && !transb, "wgrad grouped gemm currently only support TN");
 
   // Process A
-  const transformer_engine::Tensor *inputA =
-      convertNVTETensor(A[0]);
+  const transformer_engine::Tensor *inputA = convertNVTETensor(A[0]);
   if (transa) {
     NVTE_CHECK(inputA->has_columnwise_data(), "Input A is missing column-wise usage");
   } else {
@@ -684,8 +721,7 @@ void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor *A, const NVTETensor *B, N
              : reinterpret_cast<__nv_fp8_e8m0 *>(inputA->scale_inv.dptr);
 
   // Process B
-  const transformer_engine::Tensor *inputB =
-      convertNVTETensor(B[0]);
+  const transformer_engine::Tensor *inputB = convertNVTETensor(B[0]);
   if (transb) {
     NVTE_CHECK(inputB->has_data(), "Input B is missing row-wise usage");
   } else {
@@ -701,8 +737,7 @@ void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor *A, const NVTETensor *B, N
   // Process D
   void *outputD_ptr_list[num_gemms];
   for (size_t i = 0; i < num_gemms; i++) {
-    const transformer_engine::Tensor *outputD =
-        convertNVTETensor(D[i]);
+    const transformer_engine::Tensor *outputD = convertNVTETensor(D[i]);
     NVTE_CHECK(outputD->has_data(), "Input D is missing row-wise usage");
     outputD_ptr_list[i] = outputD->data.dptr;
   }
@@ -733,13 +768,13 @@ void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor *A, const NVTETensor *B, N
       generic_moe_gemm_wgrad_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3,
                                             __nv_fp8_e8m0, float, true>(
           inputA_ptr, inputA_SF_ptr, inputB_ptr, inputB_SF_ptr, outputD_ptr_list, gemm_m, gemm_n,
-          m_splits, total_gemm_k, num_gemms, accumulate,
+          m_splits, total_gemm_k, num_gemms, accumulate, workspaceSize,
           convertNVTETensor(workspace[0])->data.dptr, stream);
     } else {
       generic_moe_gemm_wgrad_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3,
-                                            __nv_fp8_e8m0, __nv_bfloat16 , true>(
+                                            __nv_fp8_e8m0, __nv_bfloat16, true>(
           inputA_ptr, inputA_SF_ptr, inputB_ptr, inputB_SF_ptr, outputD_ptr_list, gemm_m, gemm_n,
-          m_splits, total_gemm_k, num_gemms, accumulate,
+          m_splits, total_gemm_k, num_gemms, accumulate, workspaceSize,
           convertNVTETensor(workspace[0])->data.dptr, stream);
     }
   } else {
@@ -747,13 +782,13 @@ void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor *A, const NVTETensor *B, N
       generic_moe_gemm_wgrad_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3,
                                             __nv_fp8_e8m0, float, false>(
           inputA_ptr, inputA_SF_ptr, inputB_ptr, inputB_SF_ptr, outputD_ptr_list, gemm_m, gemm_n,
-          m_splits, total_gemm_k, num_gemms, accumulate,
+          m_splits, total_gemm_k, num_gemms, accumulate, workspaceSize,
           convertNVTETensor(workspace[0])->data.dptr, stream);
     } else {
       generic_moe_gemm_wgrad_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3,
-                                            __nv_fp8_e8m0, __nv_bfloat16 , false>(
+                                            __nv_fp8_e8m0, __nv_bfloat16, false>(
           inputA_ptr, inputA_SF_ptr, inputB_ptr, inputB_SF_ptr, outputD_ptr_list, gemm_m, gemm_n,
-          m_splits, total_gemm_k, num_gemms, accumulate,
+          m_splits, total_gemm_k, num_gemms, accumulate, workspaceSize,
           convertNVTETensor(workspace[0])->data.dptr, stream);
     }
   }
