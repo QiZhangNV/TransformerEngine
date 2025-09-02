@@ -78,7 +78,7 @@ __global__ void setGroupedGemmArguments(int num_experts, const int64_t *gemm_m_p
 }
 
 template <typename T, typename TSF, typename WeightType, typename WeightTypeSF, typename OutputType,
-          bool TransB>
+          bool DGrad, bool TransB>
 void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, WeightType **B_list, WeightTypeSF **SFB_list,
                                      OutputType *D, const int64_t *gemm_m_per_expert, int gemm_n,
                                      int gemm_k, int num_experts, size_t workspaceSize,
@@ -114,7 +114,7 @@ void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, WeightType **B_list, Weight
   // Core kernel configurations
   using ArchTag =
       cutlass::arch::Sm100;  // Tag indicating the minimum SM that supports the intended feature
-  using EpilogueOperatorClass = cutlass::arch::OpClassTensorOp;  // Epilogue Operator class tag
+  using EpilogueOperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;  // Epilogue Operator class tag
   using MainloopOperatorClass =
       cutlass::arch::OpClassBlockScaledTensorOp;  // Mainloop Operator class tag
   using StageCountType =
@@ -124,7 +124,7 @@ void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, WeightType **B_list, Weight
   using ClusterShape = Shape<int32_t, int32_t, _1>;
 
   struct MMA2SMConfig {
-    using MmaTileShape = Shape<_256, _256, _128>;
+    using MmaTileShape = cute::conditional_t<DGrad, Shape<_256, _256, _128>, Shape<_256, _256, _128>>;
     using KernelSchedule =
         cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmMxf8f6f4Sm100;  // Kernel to launch
     using EpilogueSchedule =
@@ -256,7 +256,7 @@ void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, WeightType **B_list, Weight
       cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
   if (!is_static_v<ClusterShape>) {
-    hw_info.cluster_shape = dim3(4, 4, 1);
+    hw_info.cluster_shape = DGrad ? dim3(2, 2, 1) : dim3(4, 4, 1);
     hw_info.cluster_shape_fallback = dim3(2, 1, 1);
   }
 
@@ -369,21 +369,41 @@ void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETen
   }
 
   if (transb) {
+    if (grad) {
     generic_moe_gemm_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3, __nv_fp8_e8m0,
-                                    __nv_bfloat16, true>(
+                                    __nv_bfloat16, true, true>(
         inputA_ptr, inputA_SF_ptr, inputB_ptr_list, inputB_SF_ptr_list, outputD_ptr,
         m_splits,  // gemm_m splits
         gemm_n,    // gemm_n
         gemm_k,    // gemm_k
         num_gemms, workspaceSize, convertNVTETensor(workspace[0])->data.dptr, stream);
+    } else {
+      generic_moe_gemm_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3, __nv_fp8_e8m0,
+                                      __nv_bfloat16, false, true>(
+          inputA_ptr, inputA_SF_ptr, inputB_ptr_list, inputB_SF_ptr_list, outputD_ptr,
+          m_splits,  // gemm_m splits
+          gemm_n,    // gemm_n
+          gemm_k,    // gemm_k
+          num_gemms, workspaceSize, convertNVTETensor(workspace[0])->data.dptr, stream);
+    }
   } else {
+    if (grad) {
     generic_moe_gemm_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3, __nv_fp8_e8m0,
-                                    __nv_bfloat16, false>(
+                                    __nv_bfloat16, true, false>(
         inputA_ptr, inputA_SF_ptr, inputB_ptr_list, inputB_SF_ptr_list, outputD_ptr,
         m_splits,  // gemm_m splits
         gemm_n,    // gemm_n
         gemm_k,    // gemm_k
         num_gemms, workspaceSize, convertNVTETensor(workspace[0])->data.dptr, stream);
+    } else {
+      generic_moe_gemm_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3, __nv_fp8_e8m0,
+                                      __nv_bfloat16, false, false>(
+          inputA_ptr, inputA_SF_ptr, inputB_ptr_list, inputB_SF_ptr_list, outputD_ptr,
+          m_splits,  // gemm_m splits
+          gemm_n,    // gemm_n
+          gemm_k,    // gemm_k
+          num_gemms, workspaceSize, convertNVTETensor(workspace[0])->data.dptr, stream);
+    }
   }
 }
 
@@ -493,7 +513,7 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
   // Core kernel configurations
   using ArchTag =
       cutlass::arch::Sm100;  // Tag indicating the minimum SM that supports the intended feature
-  using EpilogueOperatorClass = cutlass::arch::OpClassTensorOp;  // Epilogue Operator class tag
+  using EpilogueOperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;  // Epilogue Operator class tag
   using MainloopOperatorClass =
       cutlass::arch::OpClassBlockScaledTensorOp;  // Mainloop Operator class tag
   using StageCountType =
@@ -503,7 +523,7 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
   using ClusterShape = Shape<int32_t, int32_t, _1>;
 
   struct MMA2SMConfig {
-    using MmaTileShape = Shape<_256, _256, _128>;
+    using MmaTileShape = Shape<_256, _128, _128>;
     using KernelSchedule =
         cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmMxf8f6f4Sm100;  // Kernel to launch
     using EpilogueSchedule =
@@ -641,12 +661,12 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
       cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
   if (!is_static_v<ClusterShape>) {
-    hw_info.cluster_shape = dim3(4, 4, 1);
+    hw_info.cluster_shape = dim3(2, 2, 1);
     hw_info.cluster_shape_fallback = dim3(2, 1, 1);
   }
 
   typename GemmGrouped::GemmKernel::TileSchedulerArguments scheduler;
-  scheduler.raster_order = RasterOrderOptions::AlongN;
+  scheduler.raster_order = RasterOrderOptions::AlongM;
 
   args = typename GemmGrouped::Arguments{
       cutlass::gemm::GemmUniversalMode::kGrouped,
