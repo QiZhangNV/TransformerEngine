@@ -346,6 +346,7 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
   }
 
   if (m_splits_on_devie) {  // cutlass grouped gemm backend.
+    NVTE_CHECK(m_splits.dtype() == torch::kInt64, "Data type of m_splits should be int64.");
     NVTE_CHECK(A.size() == 1,
                "Grouped GEMM input A should not be splited when m_splits is on device.");
     auto te_A = makeTransformerEngineTensor(A[0], none);
