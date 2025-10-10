@@ -425,16 +425,12 @@ __global__ void setGroupedGemmWgradArguments(
   // printf("transD: %d\n", transD);
   int k_offset = 0;
   if (threadIdx.x == 0 && blockIdx.x == 0) {
-    for (int expert_id = 0; expert_id < num_experts; expert_id++) {
+  #pragma unroll
+    for (int expert_id = 0; expert_id < num_experts; ++expert_id) {
       int gemm_k = int(gemm_k_per_expert[expert_id]);
       if (gemm_k == 0) {
         // If gemm_k is 0, we need to set the problem_sizes to 0, 0, 0 to skip the gemm
         problem_sizes[expert_id] = cute::make_shape(0, 0, 0);
-        if (!accumulate_D) {
-          for (int i = 0; i < gemm_m * gemm_n; i++) {
-            ptr_D_list[expert_id][i] = ElementD(0);
-          }
-        }
         continue;
       }
       problem_sizes[expert_id] = cute::make_shape(gemm_m, gemm_n, gemm_k);
@@ -470,6 +466,49 @@ __global__ void setGroupedGemmWgradArguments(
       }
 
       k_offset += gemm_k;
+    }
+  }
+
+  // Parallel zero-fill for experts with gemm_k == 0 when not accumulating into D
+  if (!accumulate_D) {
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    int stride = blockDim.x * gridDim.x;
+    int total_elems = gemm_m * gemm_n;
+
+    // Try 16-byte vectorized stores when alignment permits, fallback to scalar otherwise
+    constexpr int bytes_per_vec = 16;
+    constexpr int elem_size = int(sizeof(ElementD));
+    constexpr int elems_per_vec = bytes_per_vec / elem_size;  // 8 for bf16
+    int total_vec = total_elems / elems_per_vec;
+    int tail = total_elems - total_vec * elems_per_vec;
+
+#pragma unroll
+    for (int expert_id = 0; expert_id < num_experts; ++expert_id) {
+      if (int(gemm_k_per_expert[expert_id]) != 0) {
+        continue;
+      }
+
+      ElementD *d_ptr = ptr_D_list[expert_id];
+      bool aligned16 = ((reinterpret_cast<size_t>(d_ptr) & (bytes_per_vec - 1)) == 0);
+
+      if (aligned16 && elems_per_vec > 0) {
+        int4 zero4; zero4.x = 0; zero4.y = 0; zero4.z = 0; zero4.w = 0;
+        int4 *vec_ptr = reinterpret_cast<int4 *>(d_ptr);
+
+#pragma unroll
+        for (int j = tid; j < total_vec; j += stride) {
+          vec_ptr[j] = zero4;
+        }
+#pragma unroll
+        for (int k = total_vec * elems_per_vec + tid; k < total_elems; k += stride) {
+          d_ptr[k] = ElementD(0);
+        }
+      } else {
+#pragma unroll
+        for (int i = tid; i < total_elems; i += stride) {
+          d_ptr[i] = ElementD(0);
+        }
+      }
     }
   }
 }
@@ -624,11 +663,19 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
   offset =
       get_aligned_offset(offset + num_experts * sizeof(ProblemShape::UnderlyingProblemShape), 128);
 
+  // Launch setGroupedGemmWgradArguments
+  constexpr int kVecBytes = 16;
+  constexpr int kElemSize = int(sizeof(typename GemmGrouped::ElementD));
+  const int elems_per_vec = kVecBytes > kElemSize ? kVecBytes / kElemSize : 1;
+  const int total_elems = gemm_m * gemm_n;
+  const int work_units = (total_elems + elems_per_vec - 1) / elems_per_vec;
+  const int threads_per_block = 256;
+  const int blocks = (work_units + threads_per_block - 1) / threads_per_block;
   setGroupedGemmWgradArguments<Sm1xxBlkScaledConfig, ProblemShape::UnderlyingProblemShape,
                                typename GemmGrouped::ElementA, typename GemmGrouped::ElementB,
                                typename GemmGrouped::ElementD,
                                typename GemmGrouped::GemmKernel::ElementSF, StrideA, StrideB,
-                               StrideD, LayoutSFA, LayoutSFB, TransD><<<1, 32, 0, stream>>>(
+                               StrideD, LayoutSFA, LayoutSFB, TransD><<<blocks, threads_per_block, 0, stream>>>(
       num_experts, gemm_m, gemm_n, gemm_k_per_expert, total_gemm_k, ptr_A, ptr_SFA, ptr_B, ptr_SFB,
       problem_sizes, ptr_A_list, ptr_SFA_list, stride_A_list, layout_SFA_list, ptr_B_list,
       ptr_SFB_list, stride_B_list, layout_SFB_list, ptr_D_list, stride_D_list, accumulate_D);
