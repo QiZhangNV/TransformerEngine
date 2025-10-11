@@ -345,7 +345,7 @@ Error_Type GroupedGemmFFI(cudaStream_t stream, Buffer_Type lhs_data, Buffer_Type
 
   auto num_math_sm = cuda::sm_count() - getenv<int>("NVTE_EXT_MARGIN_SM", 0);
   bool grad = false;
-  bool accumulate = false;
+  std::vector<bool> accumulate(num_gemms, false);
   bool use_split_accumulator = false;
   auto bias_shape = std::vector<size_t>{has_bias ? n : 0};
   const int arch = cuda::sm_arch();

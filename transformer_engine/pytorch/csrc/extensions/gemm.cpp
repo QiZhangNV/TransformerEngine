@@ -323,12 +323,12 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     std::optional<std::vector<at::Tensor>> D, DType D_type, at::Tensor m_splits,
     bool m_splits_on_devie, std::vector<at::Tensor> bias, DType bias_type, bool single_output,
     std::vector<at::Tensor> pre_gelu_out, bool grad, bool wgrad, std::vector<at::Tensor> workspace,
-    size_t workspaceSize, bool accumulate, bool use_split_accumulator, int math_sm_count) {
+    size_t workspaceSize, at::Tensor accumulate, bool use_split_accumulator, int math_sm_count) {
   std::vector<NVTETensor> te_A_vector, te_B_vector, te_D_vector, te_bias_vector,
       te_pre_gelu_out_vector, te_workspace_vector;
   std::vector<TensorWrapper> te_A_wrappers, te_B_wrappers, wrappers;
   std::vector<at::Tensor> D_vectors;
-
+  bool* accumulate_ptr = accumulate.data_ptr<bool>();
   // printf("===========call te_general_grouped_gemm===========\n");
   // printf("single_output: %d\n", single_output);
   // printf("grad: %d, wgrad: %d\n", grad, wgrad);
@@ -415,7 +415,7 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
             te_A_vector.data(), te_B_vector.data(), te_D_vector.data(),
             reinterpret_cast<int64_t*>(m_splits.data_ptr()), te_bias_vector.data(),
             te_pre_gelu_out_vector.data(), te_B_vector.size(), transa, transb, grad,
-            te_workspace_vector.data(), workspaceSize, accumulate, use_split_accumulator,
+            te_workspace_vector.data(), workspaceSize, use_split_accumulator,
             math_sm_count, at::cuda::getCurrentCUDAStream());
       });
     } else {  // wgrad
@@ -438,8 +438,8 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       auto te_B = makeTransformerEngineTensor(B[0], none);
 
       if (te_A.numel() == 0 || te_B.numel() == 0) {  // skip the GEMM
-        if (!accumulate) {
-          for (size_t i = 0; i < (*D).size(); i++) {
+        for (size_t i = 0; i < (*D).size(); i++) {
+          if (!accumulate_ptr[i]) {
             auto te_D = makeTransformerEngineTensor((*D)[i]);
             if (te_D.numel() != 0) {
               (*D)[i].zero_();
@@ -496,7 +496,7 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
             te_A_vector.data(), te_B_vector.data(), te_D_vector.data(),
             reinterpret_cast<int64_t*>(m_splits.data_ptr()), te_bias_vector.data(),
             te_pre_gelu_out_vector.data(), te_D_vector.size(), transa, transb,
-            te_workspace_vector.data(), workspaceSize, accumulate, use_split_accumulator,
+            te_workspace_vector.data(), workspaceSize, accumulate_ptr, use_split_accumulator,
             math_sm_count, at::cuda::getCurrentCUDAStream());
       });
     }
@@ -545,11 +545,12 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       }
 
       if (te_A.numel() == 0 || te_B.numel() == 0) {
-        if (out_tensor.numel() != 0 && !accumulate) out_tensor.zero_();
+        if (out_tensor.numel() != 0 && !accumulate_ptr[i]) out_tensor.zero_();
         if (bias[i].numel() != 0 && grad) {
           bias[i].zero_();
         }
         if (pre_gelu_out[i].numel() != 0) pre_gelu_out[i].zero_();
+        // TODO: Support partial accumulate for cublas backend, find an efficient way to deal with accumulate
         continue;
       }
 
@@ -594,7 +595,7 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
       nvte_multi_stream_cublas_gemm(te_A_vector.data(), te_B_vector.data(), te_D_vector.data(),
                                     te_bias_vector.data(), te_pre_gelu_out_vector.data(),
                                     te_A_vector.size(), transa, transb, grad,
-                                    te_workspace_vector.data(), accumulate, use_split_accumulator,
+                                    te_workspace_vector.data(), accumulate_ptr, use_split_accumulator,
                                     math_sm_count, at::cuda::getCurrentCUDAStream());
     });
   }

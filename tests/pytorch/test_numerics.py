@@ -1779,6 +1779,7 @@ def _test_grouped_linear_accuracy(
 @pytest.mark.parametrize("recipe", [recipe.MXFP8BlockScaling()])
 @pytest.mark.parametrize("fp8_model_params", all_boolean)
 @pytest.mark.parametrize("fuse_wgrad_accumulation", all_boolean)
+@pytest.mark.parametrize("num_unfuse_wgrad_accumulation", [0, 1, 2])
 @pytest.mark.parametrize("bias", [False])
 @pytest.mark.parametrize("delay_wgrad_compute", all_boolean)
 @pytest.mark.parametrize("m_splits_on_device", all_boolean)
@@ -1790,6 +1791,7 @@ def test_grouped_linear_accuracy(
     recipe,
     fp8_model_params,
     fuse_wgrad_accumulation,
+    num_unfuse_wgrad_accumulation,
     bias,
     delay_wgrad_compute,
     m_splits_on_device,
@@ -1802,7 +1804,15 @@ def test_grouped_linear_accuracy(
     config = model_configs[model]
     if config.max_seqlen_q % 16 != 0 and fp8:
         pytest.skip("FP8 requires sequence length to be divisible by 16.")
-
+    if num_unfuse_wgrad_accumulation > 0 and not m_splits_on_device:
+        pytest.skip("Partial accumulate is not supported when m_splits_on_device is False")
+    if fuse_wgrad_accumulation and num_unfuse_wgrad_accumulation > 0 and num_unfuse_wgrad_accumulation < num_gemms:
+        fuse_wgrad_accumulation = [True] * num_gemms
+        indices = list(range(num_gemms))
+        random.shuffle(indices)
+        for idx in indices[:num_unfuse_wgrad_accumulation]:
+            fuse_wgrad_accumulation[idx] = False
+    # print("fuse_wgrad_accumulation:", fuse_wgrad_accumulation)
     with fp8_model_init(enabled=fp8 and fp8_model_params, recipe=recipe):
         grouped_linear = GroupedLinear(
             num_gemms,
@@ -1816,6 +1826,8 @@ def test_grouped_linear_accuracy(
             delay_wgrad_compute=delay_wgrad_compute,
             save_original_input=False,
         ).eval()
+        if isinstance(fuse_wgrad_accumulation, bool):
+            fuse_wgrad_accumulation = [fuse_wgrad_accumulation] * num_gemms
         sequential_linear = torch.nn.ModuleList(
             [
                 Linear(
@@ -1825,9 +1837,9 @@ def test_grouped_linear_accuracy(
                     params_dtype=dtype,
                     parallel_mode=parallel_mode,
                     device="cuda",
-                    fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+                    fuse_wgrad_accumulation=fuse_wgrad_accumulation[i],
                 ).eval()
-                for _ in range(num_gemms)
+                for i in range(num_gemms)
             ]
         )
 
@@ -1837,7 +1849,7 @@ def test_grouped_linear_accuracy(
             sequential_linear[i].weight = Parameter(getattr(grouped_linear, f"weight{i}").clone())
             if bias:
                 sequential_linear[i].bias = Parameter(getattr(grouped_linear, f"bias{i}").clone())
-            if fuse_wgrad_accumulation:
+            if fuse_wgrad_accumulation[i]:
                 weight_i = getattr(grouped_linear, f"weight{i}")
                 weight_i.main_grad = torch.rand_like(weight_i, dtype=torch.float32)
                 sequential_linear[i].weight.main_grad = weight_i.main_grad.clone()
@@ -1889,6 +1901,7 @@ def test_grouped_linear_accuracy(
 @pytest.mark.parametrize("recipe", [recipe.MXFP8BlockScaling()])
 @pytest.mark.parametrize("fp8_model_params", [False])
 @pytest.mark.parametrize("fuse_wgrad_accumulation", [True])
+@pytest.mark.parametrize("num_unfuse_wgrad_accumulation", [0, 1, 2])
 @pytest.mark.parametrize("bias", [False])
 @pytest.mark.parametrize("delay_wgrad_compute", [True])
 @pytest.mark.parametrize("m_splits_on_device", all_boolean)
@@ -1900,6 +1913,7 @@ def test_grouped_linear_accuracy_save_original_input(
     recipe,
     fp8_model_params,
     fuse_wgrad_accumulation,
+    num_unfuse_wgrad_accumulation,
     bias,
     delay_wgrad_compute,
     m_splits_on_device,
@@ -1910,7 +1924,15 @@ def test_grouped_linear_accuracy_save_original_input(
         pytest.skip("FP8 parameters are not supported in debug mode.")
     if fp8 and recipe.delayed():
         pytest.skip("DelayedScaling recipe is not supported with save_original_input")
-
+    if num_unfuse_wgrad_accumulation > 0 and not m_splits_on_device:
+        pytest.skip("Partial accumulate is not supported when m_splits_on_device is False")
+    if fuse_wgrad_accumulation and num_unfuse_wgrad_accumulation > 0 and num_unfuse_wgrad_accumulation < num_gemms:
+        fuse_wgrad_accumulation = [True] * num_gemms
+        indices = list(range(num_gemms))
+        random.shuffle(indices)
+        for idx in indices[:num_unfuse_wgrad_accumulation]:
+            fuse_wgrad_accumulation[idx] = False
+    
     config = model_configs[model]
     if config.max_seqlen_q % 16 != 0 and fp8:
         pytest.skip("FP8 requires sequence length to be divisible by 16.")
@@ -1928,6 +1950,8 @@ def test_grouped_linear_accuracy_save_original_input(
             delay_wgrad_compute=delay_wgrad_compute,
             save_original_input=True,
         ).eval()
+        if isinstance(fuse_wgrad_accumulation, bool):
+            fuse_wgrad_accumulation = [fuse_wgrad_accumulation] * num_gemms
         sequential_linear = torch.nn.ModuleList(
             [
                 Linear(
@@ -1937,9 +1961,9 @@ def test_grouped_linear_accuracy_save_original_input(
                     params_dtype=dtype,
                     parallel_mode=parallel_mode,
                     device="cuda",
-                    fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+                    fuse_wgrad_accumulation=fuse_wgrad_accumulation[i],
                 ).eval()
-                for _ in range(num_gemms)
+                for i in range(num_gemms)
             ]
         )
 
@@ -1949,7 +1973,7 @@ def test_grouped_linear_accuracy_save_original_input(
             sequential_linear[i].weight = Parameter(getattr(grouped_linear, f"weight{i}").clone())
             if bias:
                 sequential_linear[i].bias = Parameter(getattr(grouped_linear, f"bias{i}").clone())
-            if fuse_wgrad_accumulation:
+            if fuse_wgrad_accumulation[i]:
                 weight_i = getattr(grouped_linear, f"weight{i}")
                 weight_i.main_grad = torch.rand_like(weight_i, dtype=torch.float32)
                 sequential_linear[i].weight.main_grad = weight_i.main_grad.clone()

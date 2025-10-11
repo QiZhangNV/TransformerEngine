@@ -131,7 +131,7 @@ def general_grouped_gemm(
     gelu: bool = False,
     grad=False,
     wgrad=False,
-    accumulate: bool = False,
+    accumulate: torch.Tensor = None,
     bias: Optional[List[torch.Tensor]] = None,
     use_bias: bool = False,
     use_split_accumulator: bool = False,
@@ -142,8 +142,10 @@ def general_grouped_gemm(
     TN layout Grouped GEMM with fp8 inputs.
     """
     # print("===========general_grouped_gemm===========")
+    # print("accumulate:", accumulate)
     # print(f"layout: {layout}")
     num_gemms = m_splits.size(0)
+    accumulate = accumulate if accumulate is not None else torch.zeros(num_gemms, dtype=torch.bool)
     if m_splits_on_devie:
         assert isinstance(A[0], MXFP8TensorBase) and isinstance(B[0], MXFP8TensorBase), "Only MXFP8 A and B are supported when m_splits is on device"
         assert out[0].dtype == torch.bfloat16 or (wgrad and out[0].dtype == torch.float32), "Only BF16 or FP32(only for wgard) output is supported when m_splits is on device"

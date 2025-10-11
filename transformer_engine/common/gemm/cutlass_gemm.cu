@@ -314,7 +314,7 @@ void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETen
                                const int64_t *m_splits, const NVTETensor *bias,
                                NVTETensor *pre_gelu_out, const int num_gemms, bool transa,
                                bool transb, bool grad, NVTETensor *workspace, size_t workspaceSize,
-                               bool accumulate, bool use_split_accumulator, int math_sm_count,
+                               bool use_split_accumulator, int math_sm_count,
                                cudaStream_t stream) {
   NVTE_API_CALL(nvte_cutlass_grouped_gemm);
   using namespace transformer_engine;
@@ -412,7 +412,7 @@ void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETen
  ******/
 
 template <typename Sm1xxBlkScaledConfig, typename UnderlyingProblemShape, typename ElementA,
-          typename ElementB, typename ElementD, typename ElementSF, typename StrideA,
+          typename ElementB, typename ElementC, typename ElementD, typename ElementAccumulator, typename ElementSF, typename StrideA,
           typename StrideB, typename StrideD, typename LayoutSFA, typename LayoutSFB, bool transD>
 __global__ void setGroupedGemmWgradArguments(
     int num_experts, int gemm_m, int gemm_n, const int64_t *gemm_k_per_expert, int total_gemm_k,
@@ -420,17 +420,23 @@ __global__ void setGroupedGemmWgradArguments(
     UnderlyingProblemShape *problem_sizes, ElementA **ptr_A_list, ElementSF **ptr_SFA_list,
     StrideA *stride_A_list, LayoutSFA *layout_SFA_list, ElementB **ptr_B_list,
     ElementSF **ptr_SFB_list, StrideB *stride_B_list, LayoutSFB *layout_SFB_list,
-    ElementD **ptr_D_list, StrideD *stride_D_list, bool accumulate_D) {
+    ElementD **ptr_D_list, StrideD *stride_D_list, ElementC **ptr_C_list,
+    ElementAccumulator **beta_ptr_list, ElementAccumulator *beta_zero, ElementAccumulator *beta_one,
+    bool* accumulate_D) {
   // printf("===========wgrad setGroupedGemmWgradArguments===========\n");
   // printf("transD: %d\n", transD);
   int k_offset = 0;
   if (threadIdx.x == 0 && blockIdx.x == 0) {
+    *beta_zero = 0;
+    *beta_one = 1;
   #pragma unroll
     for (int expert_id = 0; expert_id < num_experts; ++expert_id) {
       int gemm_k = int(gemm_k_per_expert[expert_id]);
       if (gemm_k == 0) {
         // If gemm_k is 0, we need to set the problem_sizes to 0, 0, 0 to skip the gemm
         problem_sizes[expert_id] = cute::make_shape(0, 0, 0);
+        ptr_C_list[expert_id] = nullptr;
+        beta_ptr_list[expert_id] = beta_zero;
         continue;
       }
       problem_sizes[expert_id] = cute::make_shape(gemm_m, gemm_n, gemm_k);
@@ -465,12 +471,20 @@ __global__ void setGroupedGemmWgradArguments(
         stride_D_list[expert_id] = cute::make_stride(int64_t(gemm_n), _1{}, _0{});
       }
 
+      if (!accumulate_D[expert_id]) {
+        ptr_C_list[expert_id] = nullptr;
+        beta_ptr_list[expert_id] = beta_zero;
+      } else {
+        ptr_C_list[expert_id] = ptr_D_list[expert_id];
+        beta_ptr_list[expert_id] = beta_one;
+      }
+      // printf("expert_id: %d, accumulate_D: %d, beta_ptr_list: %d, ptr_C_list: %s(%p)\n", expert_id, int(accumulate_D[expert_id]), int(*beta_ptr_list[expert_id]), ptr_C_list[expert_id] == nullptr ? "nullptr" : "valid", ptr_C_list[expert_id]);
+
       k_offset += gemm_k;
     }
   }
 
   // Parallel zero-fill for experts with gemm_k == 0 when not accumulating into D
-  if (!accumulate_D) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     int stride = blockDim.x * gridDim.x;
     int total_elems = gemm_m * gemm_n;
@@ -480,11 +494,10 @@ __global__ void setGroupedGemmWgradArguments(
     constexpr int elem_size = int(sizeof(ElementD));
     constexpr int elems_per_vec = bytes_per_vec / elem_size;  // 8 for bf16
     int total_vec = total_elems / elems_per_vec;
-    int tail = total_elems - total_vec * elems_per_vec;
 
 #pragma unroll
     for (int expert_id = 0; expert_id < num_experts; ++expert_id) {
-      if (int(gemm_k_per_expert[expert_id]) != 0) {
+      if (accumulate_D[expert_id] || int(gemm_k_per_expert[expert_id]) != 0) {
         continue;
       }
 
@@ -507,7 +520,6 @@ __global__ void setGroupedGemmWgradArguments(
 #pragma unroll
         for (int i = tid; i < total_elems; i += stride) {
           d_ptr[i] = ElementD(0);
-        }
       }
     }
   }
@@ -518,7 +530,7 @@ template <typename T, typename TSF, typename WeightType, typename WeightTypeSF, 
 void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, WeightTypeSF *SFB,
                                            void **D_list, int gemm_m, int gemm_n,
                                            const int64_t *gemm_k_per_expert, int total_gemm_k,
-                                           int num_experts, bool accumulate_D, size_t workspaceSize,
+                                           int num_experts, bool* accumulate_D, size_t workspaceSize,
                                            void *workspace, cudaStream_t stream,
                                            int *kernel_occupancy = nullptr) {
   using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;  // <M,N,K> per group
@@ -618,11 +630,21 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
       reinterpret_cast<char *>(workspace) + offset);
   offset = get_aligned_offset(offset + num_experts * sizeof(typename GemmGrouped::ElementB *), 128);
 
+  typename GemmGrouped::ElementC **ptr_C_list = reinterpret_cast<typename GemmGrouped::ElementC **>(
+  reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(offset + num_experts * sizeof(typename GemmGrouped::ElementC *), 128);
+
+
   typename GemmGrouped::ElementD **ptr_D_list = reinterpret_cast<typename GemmGrouped::ElementD **>(
       reinterpret_cast<char *>(workspace) + offset);
   cudaMemcpyAsync(ptr_D_list, D_list, num_experts * sizeof(typename GemmGrouped::ElementD *),
                   cudaMemcpyHostToDevice, stream);
   offset = get_aligned_offset(offset + num_experts * sizeof(typename GemmGrouped::ElementD *), 128);
+
+  bool *accumulate_D_gpu = reinterpret_cast<bool *>(reinterpret_cast<char *>(workspace) + offset);
+  cudaMemcpyAsync(accumulate_D_gpu, accumulate_D, num_experts * sizeof(bool),
+                  cudaMemcpyHostToDevice, stream);
+  offset = get_aligned_offset(offset + num_experts * sizeof(bool), 128);
 
   typename GemmGrouped::GemmKernel::ElementSF *ptr_SFA =
       reinterpret_cast<typename GemmGrouped::GemmKernel::ElementSF *>(SFA);
@@ -663,6 +685,11 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
   offset =
       get_aligned_offset(offset + num_experts * sizeof(ProblemShape::UnderlyingProblemShape), 128);
 
+  ElementAccumulator **beta_ptr_list = reinterpret_cast<ElementAccumulator **>(reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(offset + num_experts * sizeof(ElementAccumulator *), 128);
+  ElementAccumulator *beta_zero = reinterpret_cast<ElementAccumulator *>(reinterpret_cast<char *>(workspace) + offset);
+  ElementAccumulator *beta_one = reinterpret_cast<ElementAccumulator *>(reinterpret_cast<char *>(workspace) + offset + sizeof(ElementAccumulator));
+  offset = get_aligned_offset(offset + 2 * sizeof(ElementAccumulator), 128);
   // Launch setGroupedGemmWgradArguments
   constexpr int kVecBytes = 16;
   constexpr int kElemSize = int(sizeof(typename GemmGrouped::ElementD));
@@ -673,12 +700,13 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
   const int blocks = (work_units + threads_per_block - 1) / threads_per_block;
   setGroupedGemmWgradArguments<Sm1xxBlkScaledConfig, ProblemShape::UnderlyingProblemShape,
                                typename GemmGrouped::ElementA, typename GemmGrouped::ElementB,
-                               typename GemmGrouped::ElementD,
-                               typename GemmGrouped::GemmKernel::ElementSF, StrideA, StrideB,
+                               typename GemmGrouped::ElementC, typename GemmGrouped::ElementD,
+                               ElementAccumulator, typename GemmGrouped::GemmKernel::ElementSF, StrideA, StrideB,
                                StrideD, LayoutSFA, LayoutSFB, TransD><<<blocks, threads_per_block, 0, stream>>>(
       num_experts, gemm_m, gemm_n, gemm_k_per_expert, total_gemm_k, ptr_A, ptr_SFA, ptr_B, ptr_SFB,
       problem_sizes, ptr_A_list, ptr_SFA_list, stride_A_list, layout_SFA_list, ptr_B_list,
-      ptr_SFB_list, stride_B_list, layout_SFB_list, ptr_D_list, stride_D_list, accumulate_D);
+      ptr_SFB_list, stride_B_list, layout_SFB_list, ptr_D_list, stride_D_list, ptr_C_list,
+      beta_ptr_list, beta_zero, beta_one, accumulate_D_gpu);
 
   // Check for CUDA errors after kernel launch
   cudaError_t cuda_error = cudaGetLastError();
@@ -696,9 +724,9 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
   fusion_args.alpha = 1;
   fusion_args.alpha_ptr_array = nullptr;
   fusion_args.dAlpha = {_0{}, _0{}, 0};
-  fusion_args.beta = accumulate_D ? 1 : 0;
-  fusion_args.beta_ptr_array = nullptr;
-  fusion_args.dBeta = {_0{}, _0{}, 0};
+  fusion_args.beta = 0;
+  fusion_args.beta_ptr_array = beta_ptr_list;
+  fusion_args.dBeta = {_0{}, _0{}, 1};
 
   cutlass::KernelHardwareInfo hw_info;
   // Change device_id to another value if you are running on a machine with multiple GPUs and wish
@@ -725,7 +753,7 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
        const_cast<const typename GemmGrouped::GemmKernel::ElementSF **>(ptr_SFB_list),
        layout_SFB_list},
       {fusion_args,
-       accumulate_D ? const_cast<const typename GemmGrouped::ElementC **>(ptr_D_list) : nullptr,
+       const_cast<const typename GemmGrouped::ElementC **>(ptr_C_list),
        stride_D_list, ptr_D_list, stride_D_list},
       hw_info,
       scheduler};
@@ -766,7 +794,7 @@ void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor *A, const NVTETensor *B, N
                                      const int64_t *m_splits, const NVTETensor *bias,
                                      NVTETensor *pre_gelu_out, const int num_gemms, bool transa,
                                      bool transb, NVTETensor *workspace, size_t workspaceSize,
-                                     bool accumulate, bool use_split_accumulator, int math_sm_count,
+                                     bool* accumulate, bool use_split_accumulator, int math_sm_count,
                                      cudaStream_t stream) {
   NVTE_API_CALL(nvte_cutlass_grouped_gemm_wgrad);
   using namespace transformer_engine;
@@ -803,13 +831,19 @@ void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor *A, const NVTETensor *B, N
       transb ? reinterpret_cast<__nv_fp8_e8m0 *>(inputB->scale_inv.dptr)
              : reinterpret_cast<__nv_fp8_e8m0 *>(inputB->columnwise_scale_inv.dptr);
 
-  // Process D
+  // Process D and accumulate list
   void *outputD_ptr_list[num_gemms];
+  bool has_accumulate = false;
   for (size_t i = 0; i < num_gemms; i++) {
     const transformer_engine::Tensor *outputD = convertNVTETensor(D[i]);
     NVTE_CHECK(outputD->has_data(), "Input D is missing row-wise usage");
     outputD_ptr_list[i] = outputD->data.dptr;
+
+    if (accumulate[i]) {
+      has_accumulate = true;
+    }
   }
+  // printf("has_accumulate: %d\n", has_accumulate);
 
   // Get GEMM shape
   const int gemm_m = transa ? inputA->flat_last_dim() : inputA->flat_first_dim();
@@ -833,7 +867,7 @@ void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor *A, const NVTETensor *B, N
 
   bool transD = true;  // transD should be the same as transB in fprop, currently is always true
   if (transD) {
-    if (accumulate) {
+    if (has_accumulate) {
       generic_moe_gemm_wgrad_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3,
                                             __nv_fp8_e8m0, float, true>(
           inputA_ptr, inputA_SF_ptr, inputB_ptr, inputB_SF_ptr, outputD_ptr_list, gemm_m, gemm_n,
@@ -847,7 +881,7 @@ void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor *A, const NVTETensor *B, N
           convertNVTETensor(workspace[0])->data.dptr, stream);
     }
   } else {
-    if (accumulate) {
+    if (has_accumulate) {
       generic_moe_gemm_wgrad_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3,
                                             __nv_fp8_e8m0, float, false>(
           inputA_ptr, inputA_SF_ptr, inputB_ptr, inputB_SF_ptr, outputD_ptr_list, gemm_m, gemm_n,
