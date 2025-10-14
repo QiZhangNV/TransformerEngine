@@ -414,7 +414,7 @@ class _GroupedLinear(torch.autograd.Function):
                         )
                 wgrad_list = [
                     main_grads[i] if ctx.fuse_wgrad_accumulation[i] 
-                    else torch.zeros(w.size(), dtype=torch.float32 if has_fuse_wgrad_accumulation else ctx.activation_dtype, device=ctx.device)
+                    else torch.empty(w.size(), dtype=torch.float32 if has_fuse_wgrad_accumulation else ctx.activation_dtype, device=ctx.device)
                     for i,w in enumerate(weights)
                 ]
                 if ctx.save_original_input:

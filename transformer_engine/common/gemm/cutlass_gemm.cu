@@ -432,14 +432,21 @@ __global__ void setGroupedGemmWgradArguments(
   #pragma unroll
     for (int expert_id = 0; expert_id < num_experts; ++expert_id) {
       int gemm_k = int(gemm_k_per_expert[expert_id]);
+      
+      if (!accumulate_D[expert_id]) {
+        ptr_C_list[expert_id] = nullptr;
+        beta_ptr_list[expert_id] = beta_zero;
+      } else {
+        ptr_C_list[expert_id] = ptr_D_list[expert_id];
+        beta_ptr_list[expert_id] = beta_one;
+      }
+
+      problem_sizes[expert_id] = cute::make_shape(gemm_m, gemm_n, gemm_k);
       if (gemm_k == 0) {
         // If gemm_k is 0, we need to set the problem_sizes to 0, 0, 0 to skip the gemm
         problem_sizes[expert_id] = cute::make_shape(0, 0, 0);
-        ptr_C_list[expert_id] = nullptr;
-        beta_ptr_list[expert_id] = beta_zero;
         continue;
       }
-      problem_sizes[expert_id] = cute::make_shape(gemm_m, gemm_n, gemm_k);
       // printf("wgrad problem_sizes: %d, %d, %d\n", gemm_m, gemm_n, gemm_k);
 
       ptr_A_list[expert_id] = ptr_A + gemm_m * k_offset;
@@ -471,13 +478,6 @@ __global__ void setGroupedGemmWgradArguments(
         stride_D_list[expert_id] = cute::make_stride(int64_t(gemm_n), _1{}, _0{});
       }
 
-      if (!accumulate_D[expert_id]) {
-        ptr_C_list[expert_id] = nullptr;
-        beta_ptr_list[expert_id] = beta_zero;
-      } else {
-        ptr_C_list[expert_id] = ptr_D_list[expert_id];
-        beta_ptr_list[expert_id] = beta_one;
-      }
       // printf("expert_id: %d, accumulate_D: %d, beta_ptr_list: %d, ptr_C_list: %s(%p)\n", expert_id, int(accumulate_D[expert_id]), int(*beta_ptr_list[expert_id]), ptr_C_list[expert_id] == nullptr ? "nullptr" : "valid", ptr_C_list[expert_id]);
 
       k_offset += gemm_k;
@@ -564,7 +564,7 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
   // Core kernel configurations
   using ArchTag =
       cutlass::arch::Sm100;  // Tag indicating the minimum SM that supports the intended feature
-  using EpilogueOperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;  // Epilogue Operator class tag
+  using EpilogueOperatorClass = cutlass::arch::OpClassTensorOp;  // Epilogue Operator class tag
   using MainloopOperatorClass =
       cutlass::arch::OpClassBlockScaledTensorOp;  // Mainloop Operator class tag
   using StageCountType =
