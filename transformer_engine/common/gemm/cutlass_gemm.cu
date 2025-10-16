@@ -7,6 +7,7 @@
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda.h>
+#include <cuda_runtime_api.h>
 #include <float.h>
 #include <transformer_engine/gemm.h>
 #include <transformer_engine/transformer_engine.h>
@@ -33,6 +34,26 @@
 #include "cutlass/util/device_memory.h"
 
 using namespace cute;
+
+// Memory pool for host ponter array to avoid illegal memory access during CUDA graph launch.
+static std::vector<void **> host_ptrs_pool;
+void clear_host_ptrs_pool() {
+  for (auto &r : host_ptrs_pool) {
+    delete[] r;
+  }
+  host_ptrs_pool.clear();
+}
+
+static inline void maybe_cache_or_delete_host_ptrs(cudaStream_t stream,
+                                         void **host_ptrs) {
+  cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(stream, &cap_status) == cudaSuccess &&
+      cap_status != cudaStreamCaptureStatusNone) {
+    host_ptrs_pool.push_back(host_ptrs);
+  } else {
+    delete[] host_ptrs;
+  }
+}
 
 /*****
  * Fprop and Dgrad
@@ -79,7 +100,7 @@ __global__ void setGroupedGemmArguments(int num_experts, const int64_t *gemm_m_p
 
 template <typename T, typename TSF, typename WeightType, typename WeightTypeSF, typename OutputType,
           bool DGrad, bool TransB>
-void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, WeightType **B_list, WeightTypeSF **SFB_list,
+void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, void **B_list, void **SFB_list,
                                      OutputType *D, const int64_t *gemm_m_per_expert, int gemm_n,
                                      int gemm_k, int num_experts, size_t workspaceSize,
                                      void *workspace, cudaStream_t stream,
@@ -337,8 +358,8 @@ void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETen
              : reinterpret_cast<__nv_fp8_e8m0 *>(inputA->scale_inv.dptr);
 
   // Process B
-  __nv_fp8_e4m3 *inputB_ptr_list[num_gemms];
-  __nv_fp8_e8m0 *inputB_SF_ptr_list[num_gemms];
+  void **inputB_ptr_list = new void *[num_gemms];
+  void **inputB_SF_ptr_list = new void *[num_gemms];
   for (size_t i = 0; i < num_gemms; i++) {
     const transformer_engine::Tensor *inputB = convertNVTETensor(B[i]);
     if (transb) {
@@ -346,11 +367,8 @@ void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETen
     } else {
       NVTE_CHECK(inputB->has_columnwise_data(), "Input B is missing column-wise usage");
     }
-    inputB_ptr_list[i] = transb ? reinterpret_cast<__nv_fp8_e4m3 *>(inputB->data.dptr)
-                                : reinterpret_cast<__nv_fp8_e4m3 *>(inputB->columnwise_data.dptr);
-    inputB_SF_ptr_list[i] =
-        transb ? reinterpret_cast<__nv_fp8_e8m0 *>(inputB->scale_inv.dptr)
-               : reinterpret_cast<__nv_fp8_e8m0 *>(inputB->columnwise_scale_inv.dptr);
+    inputB_ptr_list[i] = transb ? inputB->data.dptr : inputB->columnwise_data.dptr;
+    inputB_SF_ptr_list[i] = transb ? inputB->scale_inv.dptr : inputB->columnwise_scale_inv.dptr;
   }
 
   // Process D
@@ -405,6 +423,10 @@ void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETen
           num_gemms, workspaceSize, convertNVTETensor(workspace[0])->data.dptr, stream);
     }
   }
+  // Cache the host pointers to avoid illegal memory access during graph launch
+  // For eager mode, we need to delete the host pointers to avoid memory leak
+  maybe_cache_or_delete_host_ptrs(stream, inputB_ptr_list);
+  maybe_cache_or_delete_host_ptrs(stream, inputB_SF_ptr_list);
 }
 
 /*****
@@ -832,7 +854,7 @@ void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor *A, const NVTETensor *B, N
              : reinterpret_cast<__nv_fp8_e8m0 *>(inputB->columnwise_scale_inv.dptr);
 
   // Process D and accumulate list
-  void *outputD_ptr_list[num_gemms];
+  void **outputD_ptr_list = new void *[num_gemms];
   bool has_accumulate = false;
   for (size_t i = 0; i < num_gemms; i++) {
     const transformer_engine::Tensor *outputD = convertNVTETensor(D[i]);
@@ -895,4 +917,6 @@ void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor *A, const NVTETensor *B, N
           convertNVTETensor(workspace[0])->data.dptr, stream);
     }
   }
+
+  maybe_cache_or_delete_host_ptrs(stream, outputD_ptr_list);
 }
