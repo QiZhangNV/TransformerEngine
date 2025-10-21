@@ -1806,13 +1806,15 @@ def test_grouped_linear_accuracy(
         pytest.skip("FP8 requires sequence length to be divisible by 16.")
     if num_unfuse_wgrad_accumulation > 0 and not m_splits_on_device:
         pytest.skip("Partial accumulate is not supported when m_splits_on_device is False")
+    wgrad_accumulation_mask = None
     if fuse_wgrad_accumulation and num_unfuse_wgrad_accumulation > 0 and num_unfuse_wgrad_accumulation < num_gemms:
-        fuse_wgrad_accumulation = [True] * num_gemms
+        wgrad_accumulation_mask = torch.ones(num_gemms, dtype=torch.bool)
         indices = list(range(num_gemms))
         random.shuffle(indices)
         for idx in indices[:num_unfuse_wgrad_accumulation]:
-            fuse_wgrad_accumulation[idx] = False
+            wgrad_accumulation_mask[idx] = False
     # print("fuse_wgrad_accumulation:", fuse_wgrad_accumulation)
+    # print("wgrad_accumulation_mask:", wgrad_accumulation_mask)
     with fp8_model_init(enabled=fp8 and fp8_model_params, recipe=recipe):
         grouped_linear = GroupedLinear(
             num_gemms,
@@ -1823,11 +1825,12 @@ def test_grouped_linear_accuracy(
             parallel_mode=parallel_mode,
             device="cuda",
             fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+            wgrad_accumulation_mask=wgrad_accumulation_mask,
             delay_wgrad_compute=delay_wgrad_compute,
             save_original_input=False,
         ).eval()
-        if isinstance(fuse_wgrad_accumulation, bool):
-            fuse_wgrad_accumulation = [fuse_wgrad_accumulation] * num_gemms
+        if wgrad_accumulation_mask is None:
+            wgrad_accumulation_mask = torch.full((num_gemms,), fuse_wgrad_accumulation, dtype=torch.bool)
         sequential_linear = torch.nn.ModuleList(
             [
                 Linear(
@@ -1837,7 +1840,7 @@ def test_grouped_linear_accuracy(
                     params_dtype=dtype,
                     parallel_mode=parallel_mode,
                     device="cuda",
-                    fuse_wgrad_accumulation=fuse_wgrad_accumulation[i],
+                    fuse_wgrad_accumulation=wgrad_accumulation_mask[i],
                 ).eval()
                 for i in range(num_gemms)
             ]
@@ -1849,7 +1852,7 @@ def test_grouped_linear_accuracy(
             sequential_linear[i].weight = Parameter(getattr(grouped_linear, f"weight{i}").clone())
             if bias:
                 sequential_linear[i].bias = Parameter(getattr(grouped_linear, f"bias{i}").clone())
-            if fuse_wgrad_accumulation[i]:
+            if wgrad_accumulation_mask[i]:
                 weight_i = getattr(grouped_linear, f"weight{i}")
                 weight_i.main_grad = torch.rand_like(weight_i, dtype=torch.float32)
                 sequential_linear[i].weight.main_grad = weight_i.main_grad.clone()
@@ -1891,6 +1894,7 @@ def test_grouped_linear_accuracy(
         # print("o_ref.shape:", o_ref.shape)
         # print("o:", o)
         # print("o_ref:", o_ref)
+        # print("diff:", o - o_ref)
         torch.testing.assert_close(o, o_ref, rtol=0, atol=0)
 
 
@@ -1926,12 +1930,13 @@ def test_grouped_linear_accuracy_save_original_input(
         pytest.skip("DelayedScaling recipe is not supported with save_original_input")
     if num_unfuse_wgrad_accumulation > 0 and not m_splits_on_device:
         pytest.skip("Partial accumulate is not supported when m_splits_on_device is False")
+    wgrad_accumulation_mask = None
     if fuse_wgrad_accumulation and num_unfuse_wgrad_accumulation > 0 and num_unfuse_wgrad_accumulation < num_gemms:
-        fuse_wgrad_accumulation = [True] * num_gemms
+        wgrad_accumulation_mask = torch.ones(num_gemms, dtype=torch.bool)
         indices = list(range(num_gemms))
         random.shuffle(indices)
         for idx in indices[:num_unfuse_wgrad_accumulation]:
-            fuse_wgrad_accumulation[idx] = False
+            wgrad_accumulation_mask[idx] = False
     
     config = model_configs[model]
     if config.max_seqlen_q % 16 != 0 and fp8:
@@ -1947,11 +1952,12 @@ def test_grouped_linear_accuracy_save_original_input(
             parallel_mode=parallel_mode,
             device="cuda",
             fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+            wgrad_accumulation_mask=wgrad_accumulation_mask,
             delay_wgrad_compute=delay_wgrad_compute,
             save_original_input=True,
         ).eval()
-        if isinstance(fuse_wgrad_accumulation, bool):
-            fuse_wgrad_accumulation = [fuse_wgrad_accumulation] * num_gemms
+        if wgrad_accumulation_mask is None:
+            wgrad_accumulation_mask = torch.full((num_gemms,), fuse_wgrad_accumulation, dtype=torch.bool)
         sequential_linear = torch.nn.ModuleList(
             [
                 Linear(
@@ -1961,7 +1967,7 @@ def test_grouped_linear_accuracy_save_original_input(
                     params_dtype=dtype,
                     parallel_mode=parallel_mode,
                     device="cuda",
-                    fuse_wgrad_accumulation=fuse_wgrad_accumulation[i],
+                    fuse_wgrad_accumulation=wgrad_accumulation_mask[i],
                 ).eval()
                 for i in range(num_gemms)
             ]
@@ -1973,7 +1979,7 @@ def test_grouped_linear_accuracy_save_original_input(
             sequential_linear[i].weight = Parameter(getattr(grouped_linear, f"weight{i}").clone())
             if bias:
                 sequential_linear[i].bias = Parameter(getattr(grouped_linear, f"bias{i}").clone())
-            if fuse_wgrad_accumulation[i]:
+            if wgrad_accumulation_mask[i]:
                 weight_i = getattr(grouped_linear, f"weight{i}")
                 weight_i.main_grad = torch.rand_like(weight_i, dtype=torch.float32)
                 sequential_linear[i].weight.main_grad = weight_i.main_grad.clone()

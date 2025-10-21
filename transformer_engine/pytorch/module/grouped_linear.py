@@ -73,7 +73,8 @@ class _GroupedLinear(torch.autograd.Function):
         weight_quantizers: List[Quantizer],
         output_quantizers: List[Quantizer],
         grad_output_quantizers: List[Quantizer],
-        fuse_wgrad_accumulation: torch.Tensor,
+        fuse_wgrad_accumulation: bool,
+        wgrad_accumulation_mask: Union[torch.Tensor, None],
         cpu_offloading: bool,
         sequence_parallel: bool,
         activation_dtype: torch.dtype,
@@ -95,7 +96,7 @@ class _GroupedLinear(torch.autograd.Function):
 
         # TODO: Support partial accumulate for cublas backend
         if not m_splits_on_devie:
-            assert fuse_wgrad_accumulation.all().item() or (not fuse_wgrad_accumulation.any().item()), "when use cublas backend, partial accumulate is not supported"
+            assert wgrad_accumulation_mask is None, "when use cublas backend, partial accumulate is not supported"
         # Configure quantizers
         if save_original_input and isinstance(input_quantizers[0], Float8Quantizer):
             raise ValueError("DelayedScaling recipe is not supported with save_original_input")
@@ -239,19 +240,19 @@ class _GroupedLinear(torch.autograd.Function):
             ctx.tensor_objects = tensor_objects
 
             ctx.weights_requires_grad = weights[0].requires_grad
-            if ctx.weights_requires_grad:
+            if fuse_wgrad_accumulation and ctx.weights_requires_grad:
                 # This check is needed to ensure that main_grad is not created
                 # during the forward pass when using MCore FSDP as it creates
                 # the main_grad buffer lazily before backprop
                 if hasattr(weights[0], "__fsdp_param__"):
                     # MCore FSDP creates main_grad lazily before backward
                     ctx.main_grad_funcs = [
-                        (weights[i].get_main_grad if fuse_wgrad_accumulation[i] else (lambda: None))
+                        (weights[i].get_main_grad if (wgrad_accumulation_mask is None or wgrad_accumulation_mask[i]) else None)
                         for i in range(num_gemms)
                     ]
                 else:
                     ctx.main_grad_funcs = [
-                        (lambda idx=i: (lambda: weights[idx].main_grad) if fuse_wgrad_accumulation[idx] else (lambda: None))()
+                        (lambda idx=i: (lambda: weights[idx].main_grad) if (wgrad_accumulation_mask is None or wgrad_accumulation_mask[idx]) else (lambda: None))()
                         for i in range(num_gemms)
                     ]
             else:
@@ -265,6 +266,7 @@ class _GroupedLinear(torch.autograd.Function):
             ctx.fp8 = fp8
             ctx.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe() if fp8 else None
             ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+            ctx.wgrad_accumulation_mask = wgrad_accumulation_mask
             ctx.cpu_offloading = cpu_offloading
             ctx.is_first_microbatch = is_first_microbatch
             ctx.use_bias = use_bias
@@ -302,10 +304,9 @@ class _GroupedLinear(torch.autograd.Function):
                 biases = saved_tensors[1 + 2 * N : 1 + 3 * N]
             main_grads = [main_grad_func() for main_grad_func in ctx.main_grad_funcs]
 
-            has_fuse_wgrad_accumulation = bool(ctx.fuse_wgrad_accumulation.any().item())
-            if ctx.cpu_offloading and has_fuse_wgrad_accumulation:
+            if ctx.cpu_offloading and ctx.fuse_wgrad_accumulation:
                 for i in range(ctx.num_gemms):
-                    if ctx.fuse_wgrad_accumulation[i]:
+                    if ctx.wgrad_accumulation_mask is None or ctx.wgrad_accumulation_mask[i]:
                         w = torch.nn.Parameter(weights[i], weights[i].requires_grad)
                         w.main_grad = main_grads[i]
                         weights[i] = w
@@ -356,8 +357,10 @@ class _GroupedLinear(torch.autograd.Function):
                     ctx.m_splits,
                 )
 
-            if ctx.is_first_microbatch is not None and ctx.is_first_microbatch:
-                accumulate_wgrad_into_param_main_grad = torch.zeros(ctx.num_gemms, dtype=torch.bool)
+            if ctx.is_first_microbatch is not None:
+                accumulate_wgrad_into_param_main_grad = (
+                    ctx.fuse_wgrad_accumulation and not ctx.is_first_microbatch
+                )
             else:
                 accumulate_wgrad_into_param_main_grad = ctx.fuse_wgrad_accumulation
 
@@ -412,11 +415,21 @@ class _GroupedLinear(torch.autograd.Function):
                         wgrad_gemm_use_split_accumulator = (
                             recipe.fp8_gemm_wgrad.use_split_accumulator
                         )
-                wgrad_list = [
-                    main_grads[i] if ctx.fuse_wgrad_accumulation[i] 
-                    else torch.empty(w.size(), dtype=torch.float32 if has_fuse_wgrad_accumulation else ctx.activation_dtype, device=ctx.device)
-                    for i,w in enumerate(weights)
-                ]
+                if ctx.fuse_wgrad_accumulation:
+                    if ctx.wgrad_accumulation_mask is None:
+                        wgrad_list = main_grads
+                    else:
+                        main_grads_dtype = next((g.dtype for g in main_grads if g is not None))
+                        wgrad_list = [
+                            main_grads[i] if ctx.wgrad_accumulation_mask[i] else torch.empty(w.size(), dtype=main_grads_dtype, device=ctx.device)
+                            for i,w in enumerate(weights)
+                        ]
+                else:
+                    wgrad_list = [
+                        torch.empty(w.size(), dtype=ctx.activation_dtype, device=ctx.device)
+                        for w in weights
+                    ]
+
                 if ctx.save_original_input:
                     inp = inputmats[0]
                     in_features = inp.shape[-1]
@@ -443,7 +456,7 @@ class _GroupedLinear(torch.autograd.Function):
                         inputmats = tex.split_quantize(inp_view, [inp_view.size(0)], ctx.input_quantizers[:1])
                 grouped_gemm_wgrad = functools.partial(
                     general_grouped_gemm,
-                    out_dtype=torch.float32 if has_fuse_wgrad_accumulation else ctx.activation_dtype,
+                    out_dtype=ctx.activation_dtype,
                     workspaces=get_multi_stream_cublas_workspace() if not ctx.m_splits_on_devie else get_cutlass_grouped_gemm_workspace(),
                     layout="NT" if not ctx.m_splits_on_devie else "TN",
                     grad=True,
@@ -454,6 +467,7 @@ class _GroupedLinear(torch.autograd.Function):
                     bias=biases,
                     use_split_accumulator=wgrad_gemm_use_split_accumulator,
                     accumulate=accumulate_wgrad_into_param_main_grad,
+                    accumulate_mask=ctx.wgrad_accumulation_mask,
                 )
                 # WGRAD
                 if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():
@@ -498,7 +512,7 @@ class _GroupedLinear(torch.autograd.Function):
                     return wgrad
 
                 wgrad_list = [
-                    handle_custom_ddp_from_mcore(weight, wgrad, ctx.fuse_wgrad_accumulation[i])
+                    handle_custom_ddp_from_mcore(weight, wgrad, ctx.fuse_wgrad_accumulation if (not ctx.fuse_wgrad_accumulation or ctx.wgrad_accumulation_mask is None) else ctx.wgrad_accumulation_mask[i])
                     for i, weight, wgrad in zip(range(ctx.num_gemms), origin_weights, wgrad_list)
                 ]
             else:
@@ -518,6 +532,7 @@ class _GroupedLinear(torch.autograd.Function):
             FP8GlobalStateManager.reduce_and_update_fp8_tensors(forward=False)
         return (
             dgrad.view(ctx.inp_shape) if ctx.requires_dgrad else None,
+            None,
             None,
             None,
             None,
@@ -569,12 +584,18 @@ class GroupedLinear(TransformerEngineBaseModule):
 
     Optimization parameters
     -----------------------
-    fuse_wgrad_accumulation : torch.Tensor, dtype=bool, default = 'None'
+    fuse_wgrad_accumulation : bool, default = 'False'
                              if set to `True`, enables fusing of creation and accumulation of
                              the weight gradient. When enabled, it is assumed that the weights
                              have an additional `main_grad` attribute (used instead of the
                              regular `grad`) which is a pre-allocated buffer of the correct
                              size to accumulate gradients in.
+    wgrad_accumulation_mask: torch.Tensor, dtype=bool, default = 'None', shape=(num_gemms,)
+                             if is not None, it will enable partial fuse_wgrad_accumulation,
+                             the mask will be used to determine which weights gradient
+                             accumulation is fused. For example, if the mask is [True, False, True],
+                             then the first and third weights gradient will be fused and accumulated
+                             into the main gradient.
     return_bias : bool, default = `False`
                  when set to `True`, this module will not apply the additive bias itself, but
                  instead return the bias value during the forward pass together with the
@@ -603,7 +624,8 @@ class GroupedLinear(TransformerEngineBaseModule):
         in_features: int,
         out_features: int,
         sequence_parallel: bool = False,
-        fuse_wgrad_accumulation: torch.Tensor = None,
+        fuse_wgrad_accumulation: bool = False,
+        wgrad_accumulation_mask: torch.Tensor = None,
         tp_group: Optional[dist_group_type] = None,
         tp_size: int = 1,
         get_rng_state_tracker: Optional[Callable] = None,
@@ -626,14 +648,11 @@ class GroupedLinear(TransformerEngineBaseModule):
         self.num_gemms = num_gemms
         self.in_features = in_features
         self.out_features = out_features
-        if fuse_wgrad_accumulation is None:
-            self.fuse_wgrad_accumulation = torch.zeros(num_gemms, dtype=torch.bool)
-        elif isinstance(fuse_wgrad_accumulation, bool):
-            self.fuse_wgrad_accumulation = torch.tensor([fuse_wgrad_accumulation] * num_gemms, dtype=torch.bool)
-        elif isinstance(fuse_wgrad_accumulation, list):
-            self.fuse_wgrad_accumulation = torch.tensor(fuse_wgrad_accumulation, dtype=torch.bool)
-        else:
-            self.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+        self.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+        self.wgrad_accumulation_mask = wgrad_accumulation_mask
+        if self.wgrad_accumulation_mask is not None:
+            assert self.fuse_wgrad_accumulation, "Partial wgrad accumulate is only supported when fuse_wgrad_accumulation is True"
+            assert self.wgrad_accumulation_mask.shape == (num_gemms,), "wgrad_accumulation_mask must have shape (num_gemms,)"
         self.use_bias = bias
         self.return_bias = return_bias
         self.apply_bias = bias and not return_bias
@@ -858,6 +877,7 @@ class GroupedLinear(TransformerEngineBaseModule):
                 output_quantizers,
                 grad_output_quantizers,
                 self.fuse_wgrad_accumulation,
+                self.wgrad_accumulation_mask,
                 is_cpu_offload_enabled(),
                 self.sequence_parallel,
                 self.activation_dtype,
@@ -887,7 +907,7 @@ class GroupedLinear(TransformerEngineBaseModule):
             weight_params = [getattr(self, f"weight{i}") for i in range(self.num_gemms)]
             bias_params = [getattr(self, f"bias{i}") for i in range(self.num_gemms)]
             for i in range(self.num_gemms):
-                if not self.fuse_wgrad_accumulation[i]:
+                if not self.fuse_wgrad_accumulation or (self.wgrad_accumulation_mask is not None and not self.wgrad_accumulation_mask[i]):
                     if weight_params[i].grad is None:
                         weight_params[i].grad = wgrad_list[i].to(weight_params[i].dtype)
             if self.use_bias:
