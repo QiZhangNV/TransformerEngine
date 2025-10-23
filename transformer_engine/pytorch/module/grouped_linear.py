@@ -818,6 +818,8 @@ class GroupedLinear(TransformerEngineBaseModule):
         assert not isinstance(
             inp, QuantizedTensorBase
         ), "GroupedLinear doesn't support input tensor in FP8."
+        if isinstance(m_splits, list):
+            m_splits = torch.tensor(m_splits)
         assert m_splits.size(0) == self.num_gemms, "Number of splits should match number of GEMMs."
 
         if FP8GlobalStateManager.fp8_graph_capturing():
