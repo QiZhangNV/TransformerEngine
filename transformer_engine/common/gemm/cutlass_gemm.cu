@@ -433,6 +433,41 @@ void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETen
  * Wgrad
  ******/
 
+// Wgrad accumulate policy: supports optional per-expert bitmap (up to 1024 experts)
+// and global accumulate switch. Passed by value to device kernel to avoid cudaMemcpyAsync.
+struct WgradAccumulatePolicy {
+  unsigned long long words[16];
+  bool partial_wgrad_accumulate; // true only when partial accumulate is enabled and mask provided
+  bool accumulate; // global accumulate switch
+
+  __host__ __device__ inline bool need_accumulate(int expert_id) const {
+    if (!accumulate) return false;
+    if (!partial_wgrad_accumulate) return true;
+    int chunk = (expert_id >> 6);
+    int bit = expert_id & 63;
+    unsigned long long w = words[chunk];
+    return ((w >> bit) & 1ull) != 0ull;
+  }
+
+  __host__ inline void set(bool do_accumulate, const bool* mask, int num_experts) {
+    accumulate = do_accumulate;
+    partial_wgrad_accumulate = (do_accumulate && mask != nullptr);
+
+    // Initialize words only when mask is used; otherwise words are don't-care
+    if (partial_wgrad_accumulate) {
+      for (int k = 0; k < 16; ++k) words[k] = ~0ull;
+      for (int i = 0; i < num_experts; ++i) {
+        if (mask[i]) continue;
+        int chunk = (i >> 6);
+        int bit = i & 63;
+        // Already checked num_experts <= 1024 when initializing GroupedLinear op.
+        // Skip out-of-range check here to avoid redundant computation.
+        words[chunk] &= ~(1ull << bit);
+      }
+    }
+  }
+};
+
 template <typename Sm1xxBlkScaledConfig, typename UnderlyingProblemShape, typename ElementA,
           typename ElementB, typename ElementC, typename ElementD, typename ElementAccumulator, typename ElementSF, typename StrideA,
           typename StrideB, typename StrideD, typename LayoutSFA, typename LayoutSFB, bool transD>
@@ -444,18 +479,17 @@ __global__ void setGroupedGemmWgradArguments(
     ElementSF **ptr_SFB_list, StrideB *stride_B_list, LayoutSFB *layout_SFB_list,
     ElementD **ptr_D_list, StrideD *stride_D_list, ElementC **ptr_C_list,
     ElementAccumulator **beta_ptr_list, ElementAccumulator *beta_zero, ElementAccumulator *beta_one,
-    bool accumulate, bool* accumulate_mask) {
+    WgradAccumulatePolicy accumulate_policy) {
   // printf("===========wgrad setGroupedGemmWgradArguments===========\n");
   // printf("transD: %d\n", transD);
   int k_offset = 0;
   if (threadIdx.x == 0 && blockIdx.x == 0) {
     *beta_zero = 0;
     *beta_one = 1;
-  #pragma unroll
+#pragma unroll
     for (int expert_id = 0; expert_id < num_experts; ++expert_id) {
       int gemm_k = int(gemm_k_per_expert[expert_id]);
-      
-      if (!accumulate || (accumulate_mask != nullptr && !accumulate_mask[expert_id])) {
+      if (!accumulate_policy.need_accumulate(expert_id)) {
         ptr_C_list[expert_id] = nullptr;
         beta_ptr_list[expert_id] = beta_zero;
       } else {
@@ -519,7 +553,7 @@ __global__ void setGroupedGemmWgradArguments(
 
 #pragma unroll
   for (int expert_id = 0; expert_id < num_experts; ++expert_id) {
-    if (int(gemm_k_per_expert[expert_id]) != 0 || (accumulate && (accumulate_mask == nullptr || accumulate_mask[expert_id]))) {
+    if (int(gemm_k_per_expert[expert_id]) != 0 || accumulate_policy.need_accumulate(expert_id)) {
       continue; // Skip zero-fill if gemm_k is not 0 or current expert need accumulate
     }
 
@@ -663,14 +697,6 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
                   cudaMemcpyHostToDevice, stream);
   offset = get_aligned_offset(offset + num_experts * sizeof(typename GemmGrouped::ElementD *), 128);
 
-  bool *accumulate_mask_gpu = nullptr;
-  if (accumulate && accumulate_mask != nullptr) {
-    accumulate_mask_gpu = reinterpret_cast<bool *>(reinterpret_cast<char *>(workspace) + offset);
-    cudaMemcpyAsync(accumulate_mask_gpu, accumulate_mask, num_experts * sizeof(bool),
-                    cudaMemcpyHostToDevice, stream);
-    offset = get_aligned_offset(offset + num_experts * sizeof(bool), 128);
-  }
-
   typename GemmGrouped::GemmKernel::ElementSF *ptr_SFA =
       reinterpret_cast<typename GemmGrouped::GemmKernel::ElementSF *>(SFA);
   typename GemmGrouped::GemmKernel::ElementSF **ptr_SFA_list =
@@ -715,6 +741,15 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
   ElementAccumulator *beta_zero = reinterpret_cast<ElementAccumulator *>(reinterpret_cast<char *>(workspace) + offset);
   ElementAccumulator *beta_one = reinterpret_cast<ElementAccumulator *>(reinterpret_cast<char *>(workspace) + offset + sizeof(ElementAccumulator));
   offset = get_aligned_offset(offset + 2 * sizeof(ElementAccumulator), 128);
+
+  // Build accumulate decision:
+  // - accumulate == false      -> no expert accumulates
+  // - accumulate == true
+  //     - accumulate_mask == nullptr -> all experts accumulate (supports any num_experts)
+  //     - accumulate_mask != nullptr -> partial accumulate; supports up to 1024 experts
+  WgradAccumulatePolicy accumulate_policy{};
+  accumulate_policy.set(accumulate, accumulate_mask, num_experts);
+  
   // Launch setGroupedGemmWgradArguments
   constexpr int kVecBytes = 16;
   constexpr int kElemSize = int(sizeof(typename GemmGrouped::ElementD));
@@ -731,7 +766,7 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
       num_experts, gemm_m, gemm_n, gemm_k_per_expert, total_gemm_k, ptr_A, ptr_SFA, ptr_B, ptr_SFB,
       problem_sizes, ptr_A_list, ptr_SFA_list, stride_A_list, layout_SFA_list, ptr_B_list,
       ptr_SFB_list, stride_B_list, layout_SFB_list, ptr_D_list, stride_D_list, ptr_C_list,
-      beta_ptr_list, beta_zero, beta_one, accumulate, accumulate_mask_gpu);
+      beta_ptr_list, beta_zero, beta_one, accumulate_policy);
 
   // Check for CUDA errors after kernel launch
   cudaError_t cuda_error = cudaGetLastError();

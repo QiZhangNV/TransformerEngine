@@ -653,6 +653,7 @@ class GroupedLinear(TransformerEngineBaseModule):
         if self.wgrad_accumulation_mask is not None:
             assert self.fuse_wgrad_accumulation, "Partial wgrad accumulate is only supported when fuse_wgrad_accumulation is True"
             assert self.wgrad_accumulation_mask.shape == (num_gemms,), "wgrad_accumulation_mask must have shape (num_gemms,)"
+            assert num_gemms <= 1024, "GroupedLinear supports up to 1024 experts when using partial wgrad accumulation"
         self.use_bias = bias
         self.return_bias = return_bias
         self.apply_bias = bias and not return_bias
