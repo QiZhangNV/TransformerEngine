@@ -101,7 +101,7 @@ def get_cutlass_grouped_gemm_workspace() -> List[torch.Tensor]:
             # Device buffer for cutlass arguments and kernel
             torch.empty(get_cutlass_grouped_gemm_workspace_size_bytes(), dtype=torch.uint8, device="cuda"),
             # Host pinned buffer for the source of H2D copy of cutlass arguments
-            torch.empty(int(os.getenv("NVTE_CUTLASS_HOST_PINNED_U64_CAPACITY", "33554432")), dtype=torch.uint8, device="cpu", pin_memory=True),
+            torch.empty(int(os.getenv("NVTE_CUTLASS_HOST_PINNED_BYTES_CAPACITY", "33554432")), dtype=torch.uint8, device="cpu", pin_memory=True),
         ]        
     return _cutlass_grouped_gemm_workspace
 
