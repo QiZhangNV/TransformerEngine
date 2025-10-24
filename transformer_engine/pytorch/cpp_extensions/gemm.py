@@ -202,7 +202,7 @@ def general_grouped_gemm(
         grad,  # grad
         wgrad,  # wgrad
         workspaces,
-        workspaces[0].shape[0],
+        [w.numel() for w in workspaces] if m_splits_on_devie else [workspaces[0].numel()],
         accumulate,
         accumulate_mask,
         use_split_accumulator,

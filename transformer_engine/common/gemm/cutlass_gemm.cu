@@ -55,6 +55,16 @@ static inline void maybe_cache_or_delete_host_ptrs(cudaStream_t stream,
   }
 }
 
+// Index of the next available slot in the pinned host buffer. Concurrency control is not implemented
+// here, as the current execution model is strictly single-threaded.
+// To avoid synchronization after H2D copy, each operator instance must use its own host buffer to
+// prevent data races — e.g., one H2D copy may still be running while another operator attempts to
+// reuse and overwrite the same buffer.
+// A global variable is used because the function doesn't know how many instances there are and which
+// instance is calling.
+// We preallocate a reasonably large ring buffer and cycle through it to manage slots dynamically.
+int pinned_host_buffer_index = 0;
+
 /*****
  * Fprop and Dgrad
  ******/
@@ -100,7 +110,7 @@ __global__ void setGroupedGemmArguments(int num_experts, const int64_t *gemm_m_p
 
 template <typename T, typename TSF, typename WeightType, typename WeightTypeSF, typename OutputType,
           bool DGrad, bool TransB>
-void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, void **B_list, void **SFB_list,
+void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, void **B_and_SFB_list,
                                      OutputType *D, const int64_t *gemm_m_per_expert, int gemm_n,
                                      int gemm_k, int num_experts, size_t workspaceSize,
                                      void *workspace, cudaStream_t stream,
@@ -195,17 +205,6 @@ void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, void **B_list, void **SFB_l
       reinterpret_cast<char *>(workspace) + offset);
   offset = get_aligned_offset(offset + num_experts * sizeof(typename GemmGrouped::ElementA *), 128);
 
-  typename GemmGrouped::ElementB **ptr_B_list = reinterpret_cast<typename GemmGrouped::ElementB **>(
-      reinterpret_cast<char *>(workspace) + offset);
-  cudaMemcpyAsync(ptr_B_list, B_list, num_experts * sizeof(typename GemmGrouped::ElementB *),
-                  cudaMemcpyHostToDevice, stream);
-  offset = get_aligned_offset(offset + num_experts * sizeof(typename GemmGrouped::ElementB *), 128);
-
-  typename GemmGrouped::ElementD *ptr_D = reinterpret_cast<typename GemmGrouped::ElementD *>(D);
-  typename GemmGrouped::ElementD **ptr_D_list = reinterpret_cast<typename GemmGrouped::ElementD **>(
-      reinterpret_cast<char *>(workspace) + offset);
-  offset = get_aligned_offset(offset + num_experts * sizeof(typename GemmGrouped::ElementD *), 128);
-
   typename GemmGrouped::GemmKernel::ElementSF *ptr_SFA =
       reinterpret_cast<typename GemmGrouped::GemmKernel::ElementSF *>(SFA);
   typename GemmGrouped::GemmKernel::ElementSF **ptr_SFA_list =
@@ -213,15 +212,17 @@ void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, void **B_list, void **SFB_l
           reinterpret_cast<char *>(workspace) + offset);
   offset = get_aligned_offset(
       offset + num_experts * sizeof(typename GemmGrouped::GemmKernel::ElementSF *), 128);
+  
+  void **ptr_B_and_SFB_list = reinterpret_cast<void **>(reinterpret_cast<char *>(workspace) + offset);
+  cudaMemcpyAsync(ptr_B_and_SFB_list, B_and_SFB_list, num_experts * sizeof(void *) * 2, cudaMemcpyHostToDevice, stream);
+  offset = get_aligned_offset(offset + num_experts * sizeof(void *) * 2, 128);
+  typename GemmGrouped::ElementB ** ptr_B_list = reinterpret_cast<typename GemmGrouped::ElementB **>(ptr_B_and_SFB_list);
+  typename GemmGrouped::GemmKernel::ElementSF ** ptr_SFB_list = reinterpret_cast<typename GemmGrouped::GemmKernel::ElementSF **>(ptr_B_and_SFB_list + num_experts);
 
-  typename GemmGrouped::GemmKernel::ElementSF **ptr_SFB_list =
-      reinterpret_cast<typename GemmGrouped::GemmKernel::ElementSF **>(
-          reinterpret_cast<char *>(workspace) + offset);
-  cudaMemcpyAsync(ptr_SFB_list, SFB_list,
-                  num_experts * sizeof(typename GemmGrouped::GemmKernel::ElementSF *),
-                  cudaMemcpyHostToDevice, stream);
-  offset = get_aligned_offset(
-      offset + num_experts * sizeof(typename GemmGrouped::GemmKernel::ElementSF *), 128);
+  typename GemmGrouped::ElementD *ptr_D = reinterpret_cast<typename GemmGrouped::ElementD *>(D);
+  typename GemmGrouped::ElementD **ptr_D_list = reinterpret_cast<typename GemmGrouped::ElementD **>(
+      reinterpret_cast<char *>(workspace) + offset);
+  offset = get_aligned_offset(offset + num_experts * sizeof(typename GemmGrouped::ElementD *), 128);
 
   StrideA *stride_A_list =
       reinterpret_cast<StrideA *>(reinterpret_cast<char *>(workspace) + offset);
@@ -334,7 +335,7 @@ void generic_moe_gemm_kernelLauncher(T *A, TSF *SFA, void **B_list, void **SFB_l
 void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETensor *D,
                                const int64_t *m_splits, const NVTETensor *bias,
                                NVTETensor *pre_gelu_out, const int num_gemms, bool transa,
-                               bool transb, bool grad, NVTETensor *workspace, size_t workspaceSize,
+                               bool transb, bool grad, NVTETensor *workspace, std::vector<size_t> workspaceSizes,
                                bool use_split_accumulator, int math_sm_count,
                                cudaStream_t stream) {
   NVTE_API_CALL(nvte_cutlass_grouped_gemm);
@@ -358,8 +359,11 @@ void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETen
              : reinterpret_cast<__nv_fp8_e8m0 *>(inputA->scale_inv.dptr);
 
   // Process B
-  void **inputB_ptr_list = new void *[num_gemms];
-  void **inputB_SF_ptr_list = new void *[num_gemms];
+  uint64_t* pinned_host_buffer = reinterpret_cast<uint64_t*>(convertNVTETensor(workspace[1])->data.dptr) + pinned_host_buffer_index;
+  const size_t pinned_host_buffer_size = workspaceSizes[1] / sizeof(uint64_t);
+  void **inputB_and_SFB_ptr_list = reinterpret_cast<void **>(pinned_host_buffer);
+  pinned_host_buffer_index = (pinned_host_buffer_index + num_gemms * 2) % pinned_host_buffer_size;
+
   for (size_t i = 0; i < num_gemms; i++) {
     const transformer_engine::Tensor *inputB = convertNVTETensor(B[i]);
     if (transb) {
@@ -367,8 +371,8 @@ void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETen
     } else {
       NVTE_CHECK(inputB->has_columnwise_data(), "Input B is missing column-wise usage");
     }
-    inputB_ptr_list[i] = transb ? inputB->data.dptr : inputB->columnwise_data.dptr;
-    inputB_SF_ptr_list[i] = transb ? inputB->scale_inv.dptr : inputB->columnwise_scale_inv.dptr;
+    inputB_and_SFB_ptr_list[i] = transb ? inputB->data.dptr : inputB->columnwise_data.dptr;
+    inputB_and_SFB_ptr_list[num_gemms + i] = transb ? inputB->scale_inv.dptr : inputB->columnwise_scale_inv.dptr;
   }
 
   // Process D
@@ -390,43 +394,39 @@ void nvte_cutlass_grouped_gemm(const NVTETensor *A, const NVTETensor *B, NVTETen
     if (grad) {
     generic_moe_gemm_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3, __nv_fp8_e8m0,
                                     __nv_bfloat16, true, true>(
-        inputA_ptr, inputA_SF_ptr, inputB_ptr_list, inputB_SF_ptr_list, outputD_ptr,
+        inputA_ptr, inputA_SF_ptr, inputB_and_SFB_ptr_list, outputD_ptr,
         m_splits,  // gemm_m splits
         gemm_n,    // gemm_n
         gemm_k,    // gemm_k
-        num_gemms, workspaceSize, convertNVTETensor(workspace[0])->data.dptr, stream);
+        num_gemms, workspaceSizes[0], convertNVTETensor(workspace[0])->data.dptr, stream);
     } else {
       generic_moe_gemm_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3, __nv_fp8_e8m0,
                                       __nv_bfloat16, false, true>(
-          inputA_ptr, inputA_SF_ptr, inputB_ptr_list, inputB_SF_ptr_list, outputD_ptr,
+          inputA_ptr, inputA_SF_ptr, inputB_and_SFB_ptr_list, outputD_ptr,
           m_splits,  // gemm_m splits
           gemm_n,    // gemm_n
           gemm_k,    // gemm_k
-          num_gemms, workspaceSize, convertNVTETensor(workspace[0])->data.dptr, stream);
+          num_gemms, workspaceSizes[0], convertNVTETensor(workspace[0])->data.dptr, stream);
     }
   } else {
     if (grad) {
     generic_moe_gemm_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3, __nv_fp8_e8m0,
                                     __nv_bfloat16, true, false>(
-        inputA_ptr, inputA_SF_ptr, inputB_ptr_list, inputB_SF_ptr_list, outputD_ptr,
+        inputA_ptr, inputA_SF_ptr, inputB_and_SFB_ptr_list, outputD_ptr,
         m_splits,  // gemm_m splits
         gemm_n,    // gemm_n
         gemm_k,    // gemm_k
-        num_gemms, workspaceSize, convertNVTETensor(workspace[0])->data.dptr, stream);
+        num_gemms, workspaceSizes[0], convertNVTETensor(workspace[0])->data.dptr, stream);
     } else {
       generic_moe_gemm_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3, __nv_fp8_e8m0,
                                       __nv_bfloat16, false, false>(
-          inputA_ptr, inputA_SF_ptr, inputB_ptr_list, inputB_SF_ptr_list, outputD_ptr,
+          inputA_ptr, inputA_SF_ptr, inputB_and_SFB_ptr_list, outputD_ptr,
           m_splits,  // gemm_m splits
           gemm_n,    // gemm_n
           gemm_k,    // gemm_k
-          num_gemms, workspaceSize, convertNVTETensor(workspace[0])->data.dptr, stream);
+          num_gemms, workspaceSizes[0], convertNVTETensor(workspace[0])->data.dptr, stream);
     }
   }
-  // Cache the host pointers to avoid illegal memory access during graph launch
-  // For eager mode, we need to delete the host pointers to avoid memory leak
-  maybe_cache_or_delete_host_ptrs(stream, inputB_ptr_list);
-  maybe_cache_or_delete_host_ptrs(stream, inputB_SF_ptr_list);
 }
 
 /*****
@@ -853,7 +853,7 @@ void generic_moe_gemm_wgrad_kernelLauncher(T *A, TSF *SFA, WeightType *B, Weight
 void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor *A, const NVTETensor *B, NVTETensor *D,
                                      const int64_t *m_splits, const NVTETensor *bias,
                                      NVTETensor *pre_gelu_out, const int num_gemms, bool transa,
-                                     bool transb, NVTETensor *workspace, size_t workspaceSize, bool accumulate,
+                                     bool transb, NVTETensor *workspace, std::vector<size_t> workspaceSizes, bool accumulate,
                                      bool* accumulate_mask, bool use_split_accumulator, int math_sm_count,
                                      cudaStream_t stream) {
   NVTE_API_CALL(nvte_cutlass_grouped_gemm_wgrad);
@@ -892,7 +892,11 @@ void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor *A, const NVTETensor *B, N
              : reinterpret_cast<__nv_fp8_e8m0 *>(inputB->columnwise_scale_inv.dptr);
 
   // Process D and accumulate list
-  void **outputD_ptr_list = new void *[num_gemms];
+  uint64_t* pinned_host_buffer = reinterpret_cast<uint64_t*>(convertNVTETensor(workspace[1])->data.dptr) + pinned_host_buffer_index;
+  const size_t pinned_host_buffer_size = workspaceSizes[1] / sizeof(uint64_t);
+  void **outputD_ptr_list = reinterpret_cast<void **>(pinned_host_buffer);
+  pinned_host_buffer_index = (pinned_host_buffer_index + num_gemms) % pinned_host_buffer_size;
+
   for (size_t i = 0; i < num_gemms; i++) {
     const transformer_engine::Tensor *outputD = convertNVTETensor(D[i]);
     NVTE_CHECK(outputD->has_data(), "Input D is missing row-wise usage");
@@ -925,13 +929,13 @@ void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor *A, const NVTETensor *B, N
       generic_moe_gemm_wgrad_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3,
                                             __nv_fp8_e8m0, float, true>(
           inputA_ptr, inputA_SF_ptr, inputB_ptr, inputB_SF_ptr, outputD_ptr_list, gemm_m, gemm_n,
-          m_splits, total_gemm_k, num_gemms, accumulate, accumulate_mask, workspaceSize,
+          m_splits, total_gemm_k, num_gemms, accumulate, accumulate_mask, workspaceSizes[0],
           convertNVTETensor(workspace[0])->data.dptr, stream);
     } else {
       generic_moe_gemm_wgrad_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3,
                                             __nv_fp8_e8m0, __nv_bfloat16, true>(
           inputA_ptr, inputA_SF_ptr, inputB_ptr, inputB_SF_ptr, outputD_ptr_list, gemm_m, gemm_n,
-          m_splits, total_gemm_k, num_gemms, accumulate, accumulate_mask, workspaceSize,
+          m_splits, total_gemm_k, num_gemms, accumulate, accumulate_mask, workspaceSizes[0],
           convertNVTETensor(workspace[0])->data.dptr, stream);
     }
   } else {
@@ -939,16 +943,14 @@ void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor *A, const NVTETensor *B, N
       generic_moe_gemm_wgrad_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3,
                                             __nv_fp8_e8m0, float, false>(
           inputA_ptr, inputA_SF_ptr, inputB_ptr, inputB_SF_ptr, outputD_ptr_list, gemm_m, gemm_n,
-          m_splits, total_gemm_k, num_gemms, accumulate, accumulate_mask, workspaceSize,
+          m_splits, total_gemm_k, num_gemms, accumulate, accumulate_mask, workspaceSizes[0],
           convertNVTETensor(workspace[0])->data.dptr, stream);
     } else {
       generic_moe_gemm_wgrad_kernelLauncher<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_fp8_e4m3,
                                             __nv_fp8_e8m0, __nv_bfloat16, false>(
           inputA_ptr, inputA_SF_ptr, inputB_ptr, inputB_SF_ptr, outputD_ptr_list, gemm_m, gemm_n,
-          m_splits, total_gemm_k, num_gemms, accumulate, accumulate_mask, workspaceSize,
+          m_splits, total_gemm_k, num_gemms, accumulate, accumulate_mask, workspaceSizes[0],
           convertNVTETensor(workspace[0])->data.dptr, stream);
     }
   }
-
-  maybe_cache_or_delete_host_ptrs(stream, outputD_ptr_list);
 }

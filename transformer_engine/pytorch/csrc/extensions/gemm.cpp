@@ -323,7 +323,7 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
     std::optional<std::vector<at::Tensor>> D, DType D_type, at::Tensor m_splits,
     bool m_splits_on_devie, std::vector<at::Tensor> bias, DType bias_type, bool single_output,
     std::vector<at::Tensor> pre_gelu_out, bool grad, bool wgrad, std::vector<at::Tensor> workspace,
-    size_t workspaceSize, bool accumulate, std::optional<at::Tensor> accumulate_mask, bool use_split_accumulator, int math_sm_count) {
+    std::vector<size_t> workspaceSizes, bool accumulate, std::optional<at::Tensor> accumulate_mask, bool use_split_accumulator, int math_sm_count) {
   std::vector<NVTETensor> te_A_vector, te_B_vector, te_D_vector, te_bias_vector,
       te_pre_gelu_out_vector, te_workspace_vector;
   std::vector<TensorWrapper> te_A_wrappers, te_B_wrappers, wrappers;
@@ -405,17 +405,19 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
         wrappers.emplace_back(std::move(te_D));
       }
 
-      auto wsp = makeTransformerEngineTensor(workspace[0].data_ptr(),
-                                             std::vector<size_t>{workspaceSize}, DType::kByte);
-      te_workspace_vector.emplace_back(wsp.data());
-      wrappers.emplace_back(std::move(wsp));
+      for (size_t i = 0; i < workspace.size(); i++) { 
+        auto wsp = makeTransformerEngineTensor(workspace[i].data_ptr(),
+                                             std::vector<size_t>{workspaceSizes[i]}, DType::kByte);
+        te_workspace_vector.emplace_back(wsp.data());
+        wrappers.emplace_back(std::move(wsp));
+      }
 
       NVTE_SCOPED_GIL_RELEASE({
         nvte_cutlass_grouped_gemm(
             te_A_vector.data(), te_B_vector.data(), te_D_vector.data(),
             reinterpret_cast<int64_t*>(m_splits.data_ptr()), te_bias_vector.data(),
             te_pre_gelu_out_vector.data(), te_B_vector.size(), transa, transb, grad,
-            te_workspace_vector.data(), workspaceSize, use_split_accumulator,
+            te_workspace_vector.data(), workspaceSizes, use_split_accumulator,
             math_sm_count, at::cuda::getCurrentCUDAStream());
       });
     } else {  // wgrad
@@ -487,16 +489,18 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
         }
       }
 
-      auto wsp = makeTransformerEngineTensor(workspace[0].data_ptr(),
-                                             std::vector<size_t>{workspaceSize}, DType::kByte);
-      te_workspace_vector.emplace_back(wsp.data());
-      wrappers.emplace_back(std::move(wsp));
+      for (size_t i = 0; i < workspace.size(); i++) {
+        auto wsp = makeTransformerEngineTensor(workspace[i].data_ptr(),
+                                             std::vector<size_t>{workspaceSizes[i]}, DType::kByte);
+        te_workspace_vector.emplace_back(wsp.data());
+        wrappers.emplace_back(std::move(wsp));
+      }
       NVTE_SCOPED_GIL_RELEASE({
         nvte_cutlass_grouped_gemm_wgrad(
             te_A_vector.data(), te_B_vector.data(), te_D_vector.data(),
             reinterpret_cast<int64_t*>(m_splits.data_ptr()), te_bias_vector.data(),
             te_pre_gelu_out_vector.data(), te_D_vector.size(), transa, transb,
-            te_workspace_vector.data(), workspaceSize, accumulate, accumulate_mask_ptr, use_split_accumulator,
+            te_workspace_vector.data(), workspaceSizes, accumulate, accumulate_mask_ptr, use_split_accumulator,
             math_sm_count, at::cuda::getCurrentCUDAStream());
       });
     }
@@ -588,7 +592,7 @@ std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
 
     for (size_t i = 0; i < workspace.size(); i++) {
       auto wsp = makeTransformerEngineTensor(workspace[i].data_ptr(),
-                                             std::vector<size_t>{workspaceSize}, DType::kByte);
+                                             std::vector<size_t>{workspaceSizes[0]}, DType::kByte);
       te_workspace_vector.emplace_back(wsp.data());
       wrappers.emplace_back(std::move(wsp));
     }
