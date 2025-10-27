@@ -110,14 +110,14 @@ void nvte_multi_stream_cublas_gemm(const NVTETensor* A, const NVTETensor* B, NVT
                                    bool use_split_accumulator, int math_sm_count,
                                    cudaStream_t stream);
 
-void nvte_cutlass_grouped_gemm(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
-                               const int64_t* m_splits, const NVTETensor* bias,
+void nvte_cutlass_grouped_gemm(const NVTETensor* A, const void** B_and_SF_addrs, NVTETensor* D,
+                               const int64_t* m_splits, const int gemm_n, const NVTETensor* bias,
                                NVTETensor* pre_gelu_out, const int num_gemms, bool transa,
                                bool transb, bool grad, NVTETensor* workspace, size_t workspaceSize,
                                bool use_split_accumulator, int math_sm_count,
                                cudaStream_t stream);
 
-void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor* A, const NVTETensor* B, NVTETensor* D,
+void nvte_cutlass_grouped_gemm_wgrad(const NVTETensor* A, const NVTETensor* B, void** D,
                                      const int64_t* m_splits, const NVTETensor* bias,
                                      NVTETensor* pre_gelu_out, const int num_gemms, bool transa,
                                      bool transb, NVTETensor* workspace, size_t workspaceSize,
