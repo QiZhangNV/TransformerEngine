@@ -230,7 +230,7 @@ void generic_moe_gemm_kernelLauncher(ElementInput *A, ElementSF *SFA, const void
       cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
   if (!is_static_v<ClusterShape>) {
-    hw_info.cluster_shape = DGrad ? dim3(2, 2, 1) : dim3(4, 4, 1);
+    hw_info.cluster_shape = dim3(4, 4, 1);
     hw_info.cluster_shape_fallback = dim3(2, 1, 1);
   }
 
