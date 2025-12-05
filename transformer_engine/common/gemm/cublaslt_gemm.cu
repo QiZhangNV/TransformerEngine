@@ -32,6 +32,20 @@ namespace {
 __device__ __constant__ float one_device;
 __device__ __constant__ float zero_device;
 
+
+template <typename T>
+__global__ void Print_tensor(T* tensor, int m, int n) {
+  printf("Print_tensor shape: %d x %d\n", m, n);
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    for (int i = 0; i < m; i++) {
+      for (int j = 0; j < n; j++) {
+        printf("%f ", static_cast<float>(tensor[i * n + j]));
+      }
+      printf("\n");
+    }
+  }
+}
+
 inline float *GetScalarOne() {
   static std::once_flag init_flag;
   std::call_once(init_flag, []() {
@@ -745,6 +759,22 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
              "Unable to find suitable cuBLAS GEMM algorithm");
   NVTE_CHECK_CUBLAS(status);
   if (returnedResults == 0) NVTE_ERROR("Unable to find any suitable algorithms");
+
+  // if (transa == CUBLAS_OP_N && transb == CUBLAS_OP_T) {
+  //   printf("cublas m: %d, n: %d, k: %d, transa: %d, transb: %d\n", m, n, k, transa, transb);
+  //   printf("cublas A:");
+  //   Print_tensor<<<1, 1>>>(reinterpret_cast<uint8_t*>(param.A), m, k/2);
+  //   cudaDeviceSynchronize();
+  //   printf("cublas A_scale_inv:");
+  //   Print_tensor<<<1, 1>>>(reinterpret_cast<fp8e4m3*>(param.A_scale_inv), m, k/16);
+  //   cudaDeviceSynchronize();
+  //   printf("cublas B:");
+  //   Print_tensor<<<1, 1>>>(reinterpret_cast<uint8_t*>(param.B), n, k/2);
+  //   cudaDeviceSynchronize(); 
+  //   printf("cublas B_scale_inv:");
+  //   Print_tensor<<<1, 1>>>(reinterpret_cast<fp8e4m3*>(param.B_scale_inv), n, k/16);
+  //   cudaDeviceSynchronize();
+  // }
 
   // D = alpha * (A * B) + beta * C
   NVTE_CHECK_CUBLAS(cublasLtMatmul(handle, operationDesc, alpha, /* alpha */

@@ -27,6 +27,7 @@ from ..utils import (
     cast_if_needed,
     clear_tensor_data,
     init_method_constant,
+    init_method_debug,
     requires_grad,
     get_nvtx_range_context,
 )
@@ -152,14 +153,25 @@ class _GroupedLinear(torch.autograd.Function):
                 inputmats = tex.split_quantize(inp_view, m_splits.tolist(), input_quantizers)
             elif debug:
                 inputmats = DebugQuantizer.multi_tensor_quantize(
-                    inp_view, input_quantizers, m_splits, activation_dtype
+                    inp_view, input_quantizers, m_splits.tolist(), activation_dtype
                 )
             else:
                 inputmats = torch.split(cast_if_needed(inp_view, activation_dtype), m_splits.tolist())
         else:
-            assert fp8 and FP8GlobalStateManager.get_fp8_recipe().mxfp8(), "Only MXFP8 is supported when m_splits is on device"
+            assert fp8 and (FP8GlobalStateManager.get_fp8_recipe().mxfp8() or FP8GlobalStateManager.get_fp8_recipe().nvfp4()), "Only MXFP8 or NVFP4 is supported when m_splits is on device"
             # Cannot split because the m_splits is not available on host.
-            inputmats = [input_quantizers[0](inp_view)]
+            if FP8GlobalStateManager.get_fp8_recipe().mxfp8():
+                inputmats = [input_quantizers[0](inp_view)]
+            else:
+
+                # print("Fprop Before split_quantize:",  inp_view, "shape:", inp_view.shape)
+                inputmats = tex.split_quantize(inp_view, [inp_view.size(0)], input_quantizers[:1])
+                inputmats_tmp = tex.split_quantize(inp_view, m_splits.tolist(), input_quantizers)
+                inputmats[0]._amax_rowwise = torch.stack([m._amax_rowwise for m in inputmats_tmp])
+                inputmats[0]._amax_columnwise = torch.stack([m._amax_columnwise for m in inputmats_tmp])
+                # print("+++Quantize inputmats as a whole:",  inputmats[0].get_metadata_debug())
+                # print("+++Quantize and split inputmats:",  [m.get_metadata_debug() for m in inputmats_tmp])
+
 
         if cpu_offloading:
             start_offload(*inputmats)
@@ -210,6 +222,7 @@ class _GroupedLinear(torch.autograd.Function):
             if hasattr(recipe, "fp8_gemm_fprop"):
                 use_split_accumulator = recipe.fp8_gemm_fprop.use_split_accumulator
 
+        # print("+++Weights:",  [w.get_metadata_debug() for w in weights_fp8])
         # Perform GEMM
         general_grouped_gemm(
             weights_fp8,
@@ -390,7 +403,16 @@ class _GroupedLinear(torch.autograd.Function):
                             ctx.grad_output_quantizers,
                         )
                     else:
-                        grad_output = [ctx.grad_output_quantizers[0](grad_output_view)]
+                        if ctx.fp8_recipe.mxfp8():
+                            grad_output = [ctx.grad_output_quantizers[0](grad_output_view)]
+                        else:
+                            # print("Dgrad Before split_quantize:",  grad_output_view, "shape:", grad_output_view.shape)
+                            grad_output = tex.split_quantize(grad_output_view, [grad_output_view.size(0)], ctx.grad_output_quantizers[:1])
+                            grad_output_tmp = tex.split_quantize(grad_output_view, ctx.m_splits.tolist(), ctx.grad_output_quantizers)
+                            grad_output[0]._amax_rowwise = torch.stack([m._amax_rowwise for m in grad_output_tmp])
+                            grad_output[0]._amax_columnwise = torch.stack([m._amax_columnwise for m in grad_output_tmp])
+                            # print("+++Quantize grad_output as a whole:",  grad_output[0].get_metadata_debug())
+                            # print("+++Quantize and split grad_output:",  [m.get_metadata_debug() for m in grad_output_tmp])
 
             elif ctx.debug:
                 grad_output_mats = torch.split(grad_output_view, ctx.m_splits.tolist())
@@ -501,9 +523,18 @@ class _GroupedLinear(torch.autograd.Function):
                                 cast_if_needed(inp_view, ctx.activation_dtype), ctx.m_splits.tolist()
                             )
                     else:
-                        assert ctx.fp8 and ctx.fp8_recipe.mxfp8(), "Only MXFP8 is supported when m_splits is on device"
+                        assert ctx.fp8 and (ctx.fp8_recipe.mxfp8() or ctx.fp8_recipe.nvfp4()), \
+                            "Only MXFP8 or NVFP4 is supported when m_splits is on device"
                         # Cannot split because the m_splits is not available on host.
-                        inputmats = [ctx.input_quantizers[0](inp_view)]
+                        if ctx.fp8_recipe.mxfp8():
+                            inputmats = [ctx.input_quantizers[0](inp_view)]
+                        else:
+                            # print("Wgrad Before split_quantize:",  inp_view, "shape:", inp_view.shape)
+                            inputmats = tex.split_quantize(inp_view, [inp_view.size(0)], ctx.input_quantizers[:1])
+                            inputmats_tmp = tex.split_quantize(inp_view, ctx.m_splits.tolist(), ctx.input_quantizers)
+                            inputmats[0]._amax_rowwise = torch.stack([m._amax_rowwise for m in inputmats_tmp])
+                            inputmats[0]._amax_columnwise = torch.stack([m._amax_columnwise for m in inputmats_tmp])
+                            # print("After assigning _amax_rowwise and _amax_columnwise to inputmats[0]:",  inputmats[0].get_metadata_debug())
 
                 grouped_gemm_wgrad = functools.partial(
                     general_grouped_gemm,

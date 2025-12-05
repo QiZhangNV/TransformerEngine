@@ -262,6 +262,16 @@ def general_grouped_gemm(
     transa = layout[0] == "T"
     transb = layout[1] == "T"
 
+    # print("dgrad: ", grad and not wgrad, "wgrad: ", wgrad)
+    # print("m_splits on device: ", m_splits_on_device, "m_splits: ", m_splits)
+    # print("A[0]:",  A[0].get_metadata_debug())
+    # print("B[0]:",  B[0].get_metadata_debug())
+    # if not m_splits_on_device:
+    #     print("+++A[1]:",  A[1].get_metadata_debug())
+    #     print("+++B[1]:",  B[1].get_metadata_debug())
+    #     print("+++A[2]:",  A[2].get_metadata_debug())
+    #     print("+++B[2]:",  B[2].get_metadata_debug())
+
     empty_tensor = _empty_tensor()
     empty_tensors = [empty_tensor] * num_gemms
 
@@ -344,8 +354,8 @@ def general_grouped_gemm(
             sm_count - int(os.getenv("NVTE_EXT_MARGIN_SM", str(sm_count))),
         )
     else:
-        assert isinstance(A[0], MXFP8TensorStorage) and isinstance(
-            B[0], MXFP8TensorStorage), "Only MXFP8 A and B are supported when m_splits is on device"
+        # assert isinstance(A[0], MXFP8TensorStorage) and isinstance(
+        #     B[0], MXFP8TensorStorage), "Only MXFP8 A and B are supported when m_splits is on device"
         assert out[0].dtype == torch.bfloat16 or out[0].dtype == torch.float16 or (
             wgrad and out[0].dtype == torch.float32), "Only BF16, FP16 or FP32(only for wgrad accumulation) output is supported when m_splits is on device"
         assert not use_bias, "Bias is not supported when m_splits is on device"

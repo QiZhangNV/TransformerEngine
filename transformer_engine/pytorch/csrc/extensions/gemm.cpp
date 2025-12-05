@@ -636,22 +636,22 @@ std::optional<std::vector<at::Tensor>> te_general_device_initiated_grouped_gemm(
     swizzled_scale_inverses_list.emplace_back(
         multi_tensor_swizzle_scaling_factors(te_B_wrappers, !transb));
 
-    // Prepare addresses array of input A and scaling factors.
+    // Prepare addresses array of input A, scaling factors and (optionally) amax.
     // To enable CUDA Graph, we need to use a pinned host buffer to avoid illegal memory access during H2D copy.
     at::Tensor inputA_and_SF_addrs;
     if (at::cuda::currentStreamCaptureStatusMayInitCtx() != at::cuda::CaptureStatus::None) {
-      NVTE_CHECK(pinned_host_buffer_index + num_gemms * 2 <= workspace[1].size(0),
+      NVTE_CHECK(pinned_host_buffer_index + num_gemms * 3 <= workspace[1].size(0),
                  "Pinned host buffer out of bounds, please increase the capacity by setting "
                  "NVTE_CUTLASS_HOST_PINNED_U64_CAPACITY. "
                  "Current buffer size: ",
                  workspace[1].size(0));
-      inputA_and_SF_addrs = workspace[1].narrow(0, pinned_host_buffer_index, num_gemms * 2);
-      pinned_host_buffer_index += num_gemms * 2;
+      inputA_and_SF_addrs = workspace[1].narrow(0, pinned_host_buffer_index, num_gemms * 3);
+      pinned_host_buffer_index += num_gemms * 3;
     } else {
       // For eager mode, use a temporary tensor to prevent exhausting the global workspace.
       auto options = at::TensorOptions().dtype(torch::kUInt64).pinned_memory(true);
       // Utilise torch tensor management to ensure memory is retained until the H2D copy is complete.
-      inputA_and_SF_addrs = at::empty(num_gemms * 2, options);
+      inputA_and_SF_addrs = at::empty(num_gemms * 3, options);
     }
     int gemm_m;
     auto* inputA_and_SF_addr_ptr = inputA_and_SF_addrs.data_ptr<uint64_t>();
@@ -663,17 +663,26 @@ std::optional<std::vector<at::Tensor>> te_general_device_initiated_grouped_gemm(
       } else {
         NVTE_CHECK(inputA->has_columnwise_data(), "Input A is missing column-wise usage");
       }
+      // A data pointer
       inputA_and_SF_addr_ptr[i] =
           transa ? static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(inputA->data.dptr))
                  : static_cast<uint64_t>(
                        reinterpret_cast<std::uintptr_t>(inputA->columnwise_data.dptr));
+      // A scaling-factor pointer
       inputA_and_SF_addr_ptr[num_gemms + i] =
           transa ? static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(inputA->scale_inv.dptr))
                  : static_cast<uint64_t>(
                        reinterpret_cast<std::uintptr_t>(inputA->columnwise_scale_inv.dptr));
+      // A amax pointer: each input tensor stores its own scalar amax.
+      inputA_and_SF_addr_ptr[2 * num_gemms + i] =
+          transa ? static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(inputA->amax.dptr))
+                 : static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(inputA->columnwise_amax.dptr));
     }
     // H2D copy
-    at::Tensor inputA_and_SF_addrs_cuda = at::from_blob(workspace[0].data_ptr(), {num_gemms * 2}, torch::TensorOptions().dtype(torch::kUInt64).device(torch::kCUDA));
+    at::Tensor inputA_and_SF_addrs_cuda =
+        at::from_blob(workspace[0].data_ptr(),
+                      {static_cast<long>(num_gemms * 3)},
+                      torch::TensorOptions().dtype(torch::kUInt64).device(torch::kCUDA));
     inputA_and_SF_addrs_cuda.copy_(inputA_and_SF_addrs, /*non_blocking=*/true);
 
     auto te_D = makeTransformerEngineTensor((*D)[0]);
