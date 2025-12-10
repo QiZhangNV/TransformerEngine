@@ -1838,24 +1838,9 @@ def _test_grouped_linear_accuracy(
         (config.max_seqlen_q, bs, config.hidden_size),
         dtype=dtype,
         device="cuda",
-        requires_grad=False,
+        requires_grad=True,
     )
 
-    for i in range(config.max_seqlen_q):
-        for j in range(config.hidden_size):
-            # inp_hidden_states[i, :, j] = 0 if i != 0 else 1
-            inp_hidden_states[i, :, j] = i%7 if j % 10 == 0 else 0
-            # inp_hidden_states[i, :, j] = 1
-    # inp_hidden_states[0,:,:] = 1
-    # inp_hidden_states[64,:,:] = 1
-    # inp_hidden_states[128,:,:] = 1
-    # inp_hidden_states[192,:,:] = 1
-    # inp_hidden_states[256,:,:] = 1
-    # inp_hidden_states[320,:,:] = 1
-    # inp_hidden_states[384,:,:] = 1
-    # inp_hidden_states[448,:,:] = 1
-
-    inp_hidden_states.requires_grad_()
     inp_hidden_states.retain_grad()
 
     if num_gemms > 1:
@@ -1887,16 +1872,10 @@ def _test_grouped_linear_accuracy(
                     for i, inp in enumerate(torch.split(inp_hidden_states, m_splits.tolist()))
                 ]
             )
-    # target = torch.rand_like(out, device=out.device, dtype=out.dtype)
-    # loss = (out * target).sum()
-    # loss.backward()
     target = torch.rand_like(out, device=out.device, dtype=out.dtype)
-    for i in range(out.shape[0]):
-        for j in range(out.shape[1]):
-            for k in range(out.shape[2]):
-                target[i, j, k] = i%7 if k % 10 == 0 else 0
     loss = (out * target).sum()
     loss.backward()
+
     if delay_wgrad_compute:
         if isinstance(block, GroupedLinear):
             block.backward_dw()
@@ -2040,12 +2019,6 @@ def test_grouped_linear_accuracy(
     torch.cuda.synchronize()
 
     for o, o_ref in zip(outputs, outputs_ref):
-        print("o:", o.shape, o)
-        print("o_ref:", o_ref.shape, o_ref)
-        for i in range(o.shape[0]):
-            if (o[i] - o_ref[i]).abs().max().item() > 1e-3:
-                # print(f"row {i} is different: o = {o[i]}, o_ref = {o_ref[i]}")
-                print(f"row {i} is different, maxdiff = {abs(o[i] - o_ref[i]).max().item()}")
         if use_cutlass:
             torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
         else:
@@ -2114,13 +2087,14 @@ def test_grouped_linear_accuracy_cutlass_device(
     nvtx.range_pop()
 
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability() != (9, 0),
-    reason="Only enable CUTLASS grouped gemm on Hopper",
+    torch.cuda.get_device_capability() != (9, 0) and torch.cuda.get_device_capability() != (10, 0),
+    reason="Only enable CUTLASS grouped gemm on Hopper and Blackwell(nvfp4 only)",
 )
 @pytest.mark.parametrize("dtype", param_types, ids=str)
 @pytest.mark.parametrize("num_gemms", [3, 6])
 @pytest.mark.parametrize("bs", batch_sizes)
 @pytest.mark.parametrize("model", ["126m"])
+@pytest.mark.parametrize("recipe", [None, nvfp4_rht_and_2d_quantization()])
 @pytest.mark.parametrize("fuse_wgrad_accumulation", all_boolean)
 @pytest.mark.parametrize("delay_wgrad_compute", all_boolean)
 def test_grouped_linear_accuracy_cutlass(
@@ -2128,16 +2102,24 @@ def test_grouped_linear_accuracy_cutlass(
     num_gemms,
     bs,
     model,
+    recipe,
     fuse_wgrad_accumulation,
     delay_wgrad_compute,
 ):
+    if torch.cuda.get_device_capability() == (9, 0):
+        if recipe is not None:
+            pytest.skip("Recipe is not supported on Hopper")
+    if torch.cuda.get_device_capability() == (10, 0):
+        if recipe is None or not recipe.nvfp4():
+            pytest.skip("Only support nvfp4 recipe on Blackwell")
+
     os.environ["NVTE_USE_CUTLASS_GROUPED_GEMM"] = "1"
     test_grouped_linear_accuracy(
         dtype,
         num_gemms,
         bs,
         model,
-        None,
+        recipe,
         False,
         fuse_wgrad_accumulation,
         False,
